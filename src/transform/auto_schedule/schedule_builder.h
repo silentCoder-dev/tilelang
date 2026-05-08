@@ -29,10 +29,36 @@ using namespace tir;
 class TaskUnionFind;
 struct ComponentInfo;
 
-bool AssignWarpgroupIdsGlobal(IRStructure *root, bool enable_warp_partition);
+// Warp specialization architecture enum
+enum class WarpSpecializeArch : uint8_t {
+  kHopper = 0,
+  kBlackwell = 1,
+  kUnsupported = 2,
+};
 
-// Naive warpgroup assignment: TMA→wg1, compute→wg0, neutral→-1
-bool NaiveAssignWarpgroupIds(IRStructure *root);
+// Configuration for warp specialization
+struct WarpSpecializeConfig {
+  WarpSpecializeArch arch = WarpSpecializeArch::kUnsupported;
+  int consumer_max_nreg = 0;
+  int producer_max_nreg = 0;
+  int producer_thread_count = 0;
+  bool enable_set_max_nreg = false;
+  bool enable_warpgroup_partition = false;
+  bool enable_thread_extend = false;
+  bool enable_warp_partition = false;
+};
+
+std::vector<PrimExpr>
+AssignWarpgroupIdsGlobal(IRStructure *root, const WarpSpecializeConfig &config,
+                         PrimExpr thread_count);
+
+// Naive warpgroup assignment: TMA→wg1, compute→wg0,
+// broadcast→kWarpgroupBroadcast
+std::vector<PrimExpr>
+NaiveAssignWarpgroupIds(IRStructure *root, const WarpSpecializeConfig &config,
+                        PrimExpr thread_count);
+
+void PropagateBroadcastWarpgroupId(IRStructure *root);
 
 // Extract all sequential task nodes from the IR structure tree
 void GatherTaskNodes(const std::vector<std::shared_ptr<IRStructure>> &nodes,
@@ -73,17 +99,20 @@ bool HasResourceDependency(const IRStructure *a, const IRStructure *b);
 // Builder that collects ScheduleUnits from IRStructure
 class ScheduleUnitBuilder {
 public:
-  bool Build(std::shared_ptr<IRStructure> &root) {
+  std::vector<PrimExpr> Build(std::shared_ptr<IRStructure> &root) {
     ScheduleRecursive(root, {});
 
     // Global warpgroup id assignment from the top level
-    return AssignWarpgroupIdsGlobal(root.get(), enable_warp_partition_);
+    auto result =
+        AssignWarpgroupIdsGlobal(root.get(), config_, thread_var_->dom->extent);
+    PropagateBroadcastWarpgroupId(root.get());
+    return result;
   }
 
   // Naive build: preserve original order, assign pipeline stages based on
   // num_stages annotation, assign warpgroup IDs by resource type
   // (TMA→wg1, compute→wg0). No Z3 scheduling.
-  bool NaiveBuild(std::shared_ptr<IRStructure> &root);
+  std::vector<PrimExpr> NaiveBuild(std::shared_ptr<IRStructure> &root);
 
   // New recursive scheduling function that replaces Collect method
   // Directly schedules the entire IRStructure tree recursively in place
@@ -101,11 +130,7 @@ public:
     size_t n = nodes.size();
     if (n <= 1) {
       if (n == 1) {
-        // For TaskNode, set start time
-        if (nodes[0]->IsTask()) {
-          auto task = static_cast<TaskNode *>(nodes[0]);
-          task->SetStartTime(0);
-        }
+        nodes[0]->SetStartTime(0);
       }
       return nodes;
     }
@@ -211,11 +236,7 @@ public:
 
       // Apply start times to nodes
       for (size_t i = 0; i < n; ++i) {
-        // Only TaskNode has SetStartTime method
-        if (nodes[i]->IsTask()) {
-          auto task = static_cast<TaskNode *>(nodes[i]);
-          task->SetStartTime(start_times[i]);
-        }
+        nodes[i]->SetStartTime(start_times[i]);
       }
 
       // Create sorted task list based on start_time (and original index as
@@ -326,27 +347,48 @@ public:
       resource_flags.push_back(flags);
     }
 
+    // Helper function to check if a buffer is written before being read
+    auto check_buffer_write_first = [&nodes](const Buffer &buffer) {
+      for (const auto &node : nodes) {
+        for (const auto &region : node->GetReadRegions()) {
+          if (region->buffer.same_as(buffer)) {
+            return false; // read access found before any write
+          }
+        }
+        for (const auto &region : node->GetWriteRegions()) {
+          if (region->buffer.same_as(buffer)) {
+            return true; // write access found before any read
+          }
+        }
+      }
+      return false;
+    };
+
     // Collect all shared buffers
     // The negative number means we can use multi-buffering for this buffer, so
     // we need to create a variable for the number of versions for this buffer
     // in z3 scheduler.
     std::vector<int64_t> buffer_sizes;
     std::map<Buffer, int64_t> buffer_to_num_versions;
+    std::set<Buffer> multi_buffering_buffers;
     int64_t memory_limit = shared_memory_limit_;
-    for (const auto &region_access : ctrl->GetReadWriteRegions()) {
-      const auto &buffer = region_access.region->buffer;
+    for (const auto &buffer_access : ctrl->GetBufferAccessInfo()) {
+      const auto &buffer = buffer_access.buffer;
       if (!IsSharedBuffer(buffer)) {
         continue; // Only consider shared buffers for multi-buffer
       }
       if (buffer_to_num_versions.count(buffer)) {
         continue;
       }
-      if (used_buffers.count(buffer)) {
+      // If the buffer is used outside the loop or is read before being written,
+      // we cannot multi-buffer it
+      if (used_buffers.count(buffer) || !check_buffer_write_first(buffer)) {
         buffer_to_num_versions[buffer] = 1;
         memory_limit -= GetBufferSize(buffer);
       } else {
         buffer_sizes.push_back(GetBufferSize(buffer));
         buffer_to_num_versions[buffer] = -(int64_t)buffer_sizes.size();
+        multi_buffering_buffers.insert(buffer);
       }
     }
 
@@ -510,6 +552,16 @@ public:
       return false;
     };
     auto SolveConflictVar = [&]() -> bool {
+      auto HasVarRawDep = [](const IRStructure *producer,
+                             const IRStructure *consumer) -> bool {
+        for (const auto &w : producer->GetWriteVars()) {
+          for (const auto &r : consumer->GetReadVars()) {
+            if (SameVar(w, r))
+              return true;
+          }
+        }
+        return false;
+      };
       for (int i = 0; i < n; ++i)
         if (IsVarDecl(seq_body->children[i].get())) {
           for (int j = 0; j < n; ++j) {
@@ -520,7 +572,7 @@ public:
             auto node_j = seq_body->children[j].get();
             int rem_stage_j = stage_map[node_j];
 
-            if (!HasDependency(node_i, node_j))
+            if (!HasVarRawDep(node_i, node_j))
               continue;
 
             if (stage_map[node_j] == stage_map[node_i])
@@ -539,13 +591,30 @@ public:
                         Evaluate(0));
             auto cloned_task = std::make_shared<TaskNode>();
             cloned_task->stmts.push_back(cloned_let_stmt);
+            cloned_task->SetReadRegions(node_i_task->GetReadRegions());
+            cloned_task->SetWriteRegions(node_i_task->GetWriteRegions());
+            cloned_task->SetReadVars(node_i_task->GetReadVars());
+            {
+              auto write_vars = node_i_task->GetWriteVars();
+              for (auto &v : write_vars) {
+                if (v.same_as(node_i_let_stmt->var)) {
+                  v = cloned_let_stmt->var;
+                }
+              }
+              cloned_task->SetWriteVars(write_vars);
+            }
+            cloned_task->SetLatency(node_i_task->GetLatency());
+            cloned_task->SetII(node_i_task->GetII());
+            cloned_task->SetUsesCUDACore(node_i_task->UsesCUDACore());
+            cloned_task->SetUsesTMACore(node_i_task->UsesTMACore());
+            cloned_task->SetUsesTensorCore(node_i_task->UsesTensorCore());
             stage_map[cloned_task.get()] = rem_stage_j;
 
             for (int k = j; k < n; ++k) {
               auto node_k = seq_body->children[k].get();
               if (rem_stage_j != stage_map[node_k])
                 continue;
-              if (HasDependency(node_i, node_k)) {
+              if (HasVarRawDep(node_i, node_k)) {
                 node_k->SubstituteVar(node_i_let_stmt->var,
                                       cloned_let_stmt->var);
                 stage_map[node_k] = rem_stage_j;
@@ -612,20 +681,23 @@ public:
     ctrl->SetII(overall_latency);
     ctrl->SetLatency(overall_latency);
     ctrl->SetIIperIter(ii);
+    ctrl->multi_buffering_buffers = std::move(multi_buffering_buffers);
   }
 
   // Set thread index variable for warpgroup partition
   void SetThreadVar(IterVar thread_var) { thread_var_ = thread_var; }
 
-  // Set enable_warp_partition flag
-  void SetEnableWarpPartition(bool enable) { enable_warp_partition_ = enable; }
+  // Set warp specialization configuration
+  void SetWarpSpecializeConfig(const WarpSpecializeConfig &config) {
+    config_ = config;
+  }
 
   // Set shared memory limit for pipeline (in bytes)
   void SetSharedMemoryLimit(int64_t bytes) { shared_memory_limit_ = bytes; }
 
 private:
-  IterVar thread_var_; // Thread index variable for warpgroup partition
-  bool enable_warp_partition_ = false;
+  IterVar thread_var_;          // Thread index variable for warpgroup partition
+  WarpSpecializeConfig config_; // Configuration for warp specialization
   int64_t shared_memory_limit_ = 48 * 1024;
 };
 

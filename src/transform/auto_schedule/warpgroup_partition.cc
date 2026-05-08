@@ -48,6 +48,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <queue>
 #include <sstream>
@@ -69,6 +70,208 @@ namespace tl {
 
 using namespace tir;
 using ffi::GetRef;
+
+class LetStmtVarRenamer : public StmtExprMutator {
+public:
+  explicit LetStmtVarRenamer(const std::string &suffix) : suffix_(suffix) {}
+
+  Stmt Rename(Stmt stmt) {
+    CollectLetVars(stmt);
+    if (var_remap_.empty())
+      return stmt;
+    return VisitStmt(stmt);
+  }
+
+private:
+  void CollectLetVars(const Stmt &stmt) {
+    class Collector : public StmtExprVisitor {
+    public:
+      explicit Collector(Map<Var, Var> &remap, const std::string &suffix)
+          : remap_(remap), suffix_(suffix) {}
+      void VisitStmt_(const LetStmtNode *op) final {
+        remap_.Set(op->var, op->var.copy_with_suffix(suffix_));
+        StmtExprVisitor::VisitStmt_(op);
+      }
+      Map<Var, Var> &remap_;
+      const std::string &suffix_;
+    };
+    Collector c(var_remap_, suffix_);
+    c(stmt);
+  }
+
+  Stmt VisitStmt_(const LetStmtNode *op) final {
+    auto it = var_remap_.find(op->var);
+    Var new_var = it != var_remap_.end() ? (*it).second : op->var;
+    PrimExpr new_value = VisitExpr(op->value);
+    Stmt new_body = VisitStmt(op->body);
+    return LetStmt(new_var, new_value, new_body, op->span);
+  }
+
+  PrimExpr VisitExpr_(const VarNode *op) final {
+    Var var = GetRef<Var>(op);
+    auto it = var_remap_.find(var);
+    if (it != var_remap_.end()) {
+      return (*it).second;
+    }
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
+  std::string suffix_;
+  Map<Var, Var> var_remap_;
+};
+
+static Stmt RenameLetStmtVars(Stmt stmt, const std::string &suffix) {
+  return LetStmtVarRenamer(suffix).Rename(std::move(stmt));
+}
+
+// Mutator that replaces references to selected Buffers with their duplicates.
+class BufferRemapMutator : public StmtExprMutator {
+public:
+  explicit BufferRemapMutator(const Map<Buffer, Buffer> &buffer_remap)
+      : buffer_remap_(buffer_remap) {
+    for (const auto &kv : buffer_remap_) {
+      var_to_new_buffer_.Set(kv.first->data, kv.second);
+    }
+  }
+
+  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
+    auto it = buffer_remap_.find(load->buffer);
+    if (it == buffer_remap_.end())
+      return std::move(load);
+    auto *n = load.CopyOnWrite();
+    n->buffer = (*it).second;
+    return std::move(load);
+  }
+
+  Stmt VisitStmt_(const BufferStoreNode *op) final {
+    BufferStore store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
+    auto it = buffer_remap_.find(store->buffer);
+    if (it == buffer_remap_.end())
+      return std::move(store);
+    auto *n = store.CopyOnWrite();
+    n->buffer = (*it).second;
+    return std::move(store);
+  }
+
+  PrimExpr VisitExpr_(const VarNode *op) final {
+    Var var = GetRef<Var>(op);
+    auto it = var_to_new_buffer_.find(var);
+    if (it != var_to_new_buffer_.end()) {
+      return (*it).second->data;
+    }
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
+  BufferRegion RemapRegion(const BufferRegion &region) const {
+    auto it = buffer_remap_.find(region->buffer);
+    if (it == buffer_remap_.end())
+      return region;
+    return BufferRegion((*it).second, region->region);
+  }
+
+  Var RemapVar(const Var &var) const {
+    auto it = var_to_new_buffer_.find(var);
+    if (it == var_to_new_buffer_.end())
+      return var;
+    return (*it).second->data;
+  }
+
+private:
+  const Map<Buffer, Buffer> &buffer_remap_;
+  Map<Var, Buffer> var_to_new_buffer_;
+};
+
+// Collect all local / local.var / local.fragment Buffers written by
+// broadcast tasks so each warpgroup gets its own private copy.
+static void CollectBroadcastFragmentBuffersImpl(
+    const IRStructure *node, std::unordered_set<const BufferNode *> &seen,
+    std::vector<Buffer> &out) {
+  if (!node)
+    return;
+  if (node->IsTask()) {
+    auto task = static_cast<const TaskNode *>(node);
+    if (IsWarpgroupBroadcast(task->GetWarpgroupId())) {
+      for (const auto &region : task->GetWriteRegions()) {
+        if (IsRegisterRegion(region) &&
+            (IsFragmentBuffer(region->buffer) ||
+             IsLocalBuffer(region->buffer, /*allow_var=*/true))) {
+          if (!seen.count(region->buffer.get())) {
+            seen.insert(region->buffer.get());
+            out.push_back(region->buffer);
+          }
+        }
+      }
+    }
+  } else if (node->IsSequence()) {
+    for (const auto &child :
+         static_cast<const SequenceNode *>(node)->children) {
+      CollectBroadcastFragmentBuffersImpl(child.get(), seen, out);
+    }
+  } else if (node->IsControl()) {
+    auto ctrl = static_cast<const ControlNode *>(node);
+    CollectBroadcastFragmentBuffersImpl(ctrl->task.get(), seen, out);
+    CollectBroadcastFragmentBuffersImpl(ctrl->child.get(), seen, out);
+  } else if (node->IsWrapper()) {
+    auto wrapper = static_cast<const WrapperNode *>(node);
+    CollectBroadcastFragmentBuffersImpl(wrapper->task.get(), seen, out);
+    CollectBroadcastFragmentBuffersImpl(wrapper->child.get(), seen, out);
+  } else if (node->IsScheduleUnit()) {
+    CollectBroadcastFragmentBuffersImpl(
+        static_cast<const ScheduleUnit *>(node)->child.get(), seen, out);
+  } else if (node->IsIf()) {
+    auto if_node = static_cast<const IfNode *>(node);
+    CollectBroadcastFragmentBuffersImpl(if_node->task.get(), seen, out);
+    CollectBroadcastFragmentBuffersImpl(if_node->then_child.get(), seen, out);
+    CollectBroadcastFragmentBuffersImpl(if_node->else_child.get(), seen, out);
+  }
+}
+
+static std::vector<Buffer>
+CollectBroadcastFragmentBuffers(const IRStructure *root) {
+  std::vector<Buffer> result;
+  std::unordered_set<const BufferNode *> seen;
+  CollectBroadcastFragmentBuffersImpl(root, seen, result);
+  return result;
+}
+
+static Buffer DuplicateFragmentBuffer(const Buffer &buffer,
+                                      const std::string &suffix) {
+  Type new_type = buffer->data->type_annotation;
+  if (IsFragmentBuffer(buffer)) {
+    const auto *ptr_type = buffer->data->type_annotation.as<PointerTypeNode>();
+    ICHECK(ptr_type);
+    new_type = PointerType(ptr_type->element_type, "local");
+  }
+  Var new_var(buffer->data->name_hint + suffix, new_type);
+  return Buffer(new_var, buffer->dtype, buffer->shape, buffer->strides,
+                buffer->elem_offset, buffer->name + suffix,
+                buffer->data_alignment, buffer->offset_factor,
+                buffer->buffer_type);
+}
+
+static void ApplyBufferRemapToTask(TaskNode *task,
+                                   BufferRemapMutator &mutator) {
+  for (size_t i = 0; i < task->stmts.size(); ++i) {
+    task->stmts[i] = mutator(task->stmts[i]);
+  }
+  auto read_regions = task->GetReadRegions();
+  for (auto &r : read_regions)
+    r = mutator.RemapRegion(r);
+  task->SetReadRegions(read_regions);
+  auto write_regions = task->GetWriteRegions();
+  for (auto &r : write_regions)
+    r = mutator.RemapRegion(r);
+  task->SetWriteRegions(write_regions);
+  auto read_vars = task->GetReadVars();
+  for (auto &v : read_vars)
+    v = mutator.RemapVar(v);
+  task->SetReadVars(read_vars);
+  auto write_vars = task->GetWriteVars();
+  for (auto &v : write_vars)
+    v = mutator.RemapVar(v);
+  task->SetWriteVars(write_vars);
+}
 
 bool IsLetDeclTask(const TaskNode *task) {
   return task->stmts.size() == 1 && task->stmts[0].as<LetStmtNode>() != nullptr;
@@ -111,6 +314,12 @@ bool ContainsLetDecl(const IRStructure *node) {
   } else if (node->IsScheduleUnit()) {
     auto unit = static_cast<const ScheduleUnit *>(node);
     return ContainsLetDecl(unit->child.get());
+  } else if (node->IsIf()) {
+    auto if_node = static_cast<const IfNode *>(node);
+    if (ContainsLetDecl(if_node->then_child.get()))
+      return true;
+    if (if_node->else_child && ContainsLetDecl(if_node->else_child.get()))
+      return true;
   }
   return false;
 }
@@ -118,12 +327,36 @@ bool ContainsLetDecl(const IRStructure *node) {
 // Helper function to clone IRStructure with warpgroup filter.
 std::shared_ptr<IRStructure>
 CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
-                                    Map<Var, PrimExpr> &var_remap) {
+                                    Map<Var, PrimExpr> &var_remap,
+                                    Map<Buffer, Buffer> &buffer_remap) {
   if (!node)
     return nullptr;
 
+  auto apply_buffer_remap_stmt = [&](Stmt s) -> Stmt {
+    if (buffer_remap.empty())
+      return s;
+    BufferRemapMutator m(buffer_remap);
+    return m(std::move(s));
+  };
+  auto apply_buffer_remap_expr = [&](PrimExpr e) -> PrimExpr {
+    if (buffer_remap.empty())
+      return e;
+    BufferRemapMutator m(buffer_remap);
+    return m(std::move(e));
+  };
+  auto apply_buffer_remap_task = [&](TaskNode *ct) {
+    if (buffer_remap.empty())
+      return;
+    BufferRemapMutator m(buffer_remap);
+    ApplyBufferRemapToTask(ct, m);
+  };
+
   if (node->IsTask()) {
     auto task = static_cast<TaskNode *>(node);
+    if (task->GetSchedulePhase() != SchedulePhase::kBody) {
+      auto new_task = std::make_shared<TaskNode>();
+      return new_task;
+    }
 
     // LetDecl tasks are always included in every warp group clone.
     // Create a fresh variable copy so the two warp groups use different names.
@@ -133,6 +366,7 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
       // Substitute previously renamed variables in the value expression.
       PrimExpr new_value =
           var_remap.empty() ? let->value : Substitute(let->value, var_remap);
+      new_value = apply_buffer_remap_expr(new_value);
       var_remap.Set(let->var, new_var);
       auto new_task = std::make_shared<TaskNode>();
       new_task->stmts.push_back(LetStmt(new_var, new_value, Evaluate(0)));
@@ -150,6 +384,7 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
         ct->stmts[i] = Substitute(ct->stmts[i], var_remap);
       }
     }
+    apply_buffer_remap_task(static_cast<TaskNode *>(cloned.get()));
     return cloned;
   } else if (node->IsSequence()) {
     // A SequenceNode is included if it contains the target warp group
@@ -160,7 +395,7 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
     auto new_seq = std::make_shared<SequenceNode>();
     for (const auto &child : seq->children) {
       auto new_child = CloneIRStructureWithWarpgroupFilter(
-          child.get(), warpgroup_id, var_remap);
+          child.get(), warpgroup_id, var_remap, buffer_remap);
       if (new_child) {
         new_seq->children.push_back(std::move(new_child));
       }
@@ -175,21 +410,19 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
       return nullptr;
     auto ctrl = static_cast<ControlNode *>(node);
     auto new_ctrl = std::make_shared<ControlNode>();
-    // Apply var_remap to the For statement's min/extent/step so that renamed
-    // LetDecl variables are correctly referenced in the loop bounds.
-    if (!var_remap.empty()) {
-      For new_for = ctrl->control;
-      new_for.CopyOnWrite()->min = Substitute(ctrl->control->min, var_remap);
-      new_for.CopyOnWrite()->extent =
-          Substitute(ctrl->control->extent, var_remap);
-      if (ctrl->control->step.has_value()) {
-        new_for.CopyOnWrite()->step =
-            Substitute(ctrl->control->step.value(), var_remap);
-      }
-      new_ctrl->control = new_for;
-    } else {
-      new_ctrl->control = ctrl->control;
+    For new_for = ctrl->control;
+    auto new_loop_var = ctrl->control->loop_var.copy_with_suffix("");
+    new_for.CopyOnWrite()->loop_var = new_loop_var;
+    var_remap.Set(ctrl->control->loop_var, new_loop_var);
+    new_for.CopyOnWrite()->min =
+        apply_buffer_remap_expr(Substitute(ctrl->control->min, var_remap));
+    new_for.CopyOnWrite()->extent =
+        apply_buffer_remap_expr(Substitute(ctrl->control->extent, var_remap));
+    if (ctrl->control->step.has_value()) {
+      new_for.CopyOnWrite()->step = apply_buffer_remap_expr(
+          Substitute(ctrl->control->step.value(), var_remap));
     }
+    new_ctrl->control = new_for;
     // Clone the task and apply var_remap so each warpgroup gets its own copy
     // with correctly renamed LetDecl variables.
     if (ctrl->task) {
@@ -200,11 +433,12 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
           cloned_task->stmts[i] = Substitute(cloned_task->stmts[i], var_remap);
         }
       }
+      apply_buffer_remap_task(cloned_task.get());
       new_ctrl->task = std::move(cloned_task);
     }
     new_ctrl->SetPromote(ctrl->hasPromote());
     new_ctrl->child = CloneIRStructureWithWarpgroupFilter(
-        ctrl->child.get(), warpgroup_id, var_remap);
+        ctrl->child.get(), warpgroup_id, var_remap, buffer_remap);
     return new_ctrl;
   } else if (node->IsWrapper()) {
     if (!node->containWarpgroupId(warpgroup_id) && !ContainsLetDecl(node))
@@ -216,8 +450,9 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
     new_wrapper->wrapper = var_remap.empty()
                                ? wrapper->wrapper
                                : Substitute(wrapper->wrapper, var_remap);
+    new_wrapper->wrapper = apply_buffer_remap_stmt(new_wrapper->wrapper);
     new_wrapper->child = CloneIRStructureWithWarpgroupFilter(
-        wrapper->child.get(), warpgroup_id, var_remap);
+        wrapper->child.get(), warpgroup_id, var_remap, buffer_remap);
     return new_wrapper;
   } else if (node->IsScheduleUnit()) {
     auto unit = static_cast<ScheduleUnit *>(node);
@@ -231,190 +466,129 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
     auto new_unit = std::make_shared<ScheduleUnit>();
     new_unit->stage = unit->stage;
     new_unit->child = CloneIRStructureWithWarpgroupFilter(
-        unit->child.get(), warpgroup_id, var_remap);
+        unit->child.get(), warpgroup_id, var_remap, buffer_remap);
 
-    if (!child_is_let_decl) {
-      // Copy before/after for the target warp group
-      new_unit->before[warpgroup_id] = unit->before[warpgroup_id];
-      new_unit->after[warpgroup_id] = unit->after[warpgroup_id];
-      // Substitute renamed LetDecl variables in before/after stmts
-      if (!var_remap.empty()) {
-        for (auto &s : new_unit->before[warpgroup_id]) {
-          s = Substitute(s, var_remap);
-        }
-        for (auto &s : new_unit->after[warpgroup_id]) {
-          s = Substitute(s, var_remap);
-        }
+    // Copy before/after for the target warp group
+    new_unit->before[warpgroup_id] = unit->before[warpgroup_id];
+    new_unit->after[warpgroup_id] = unit->after[warpgroup_id];
+    // Substitute renamed LetDecl variables in before/after stmts
+    if (!var_remap.empty()) {
+      for (auto &s : new_unit->before[warpgroup_id]) {
+        s = Substitute(s, var_remap);
+      }
+      for (auto &s : new_unit->after[warpgroup_id]) {
+        s = Substitute(s, var_remap);
       }
     }
+    for (auto &s : new_unit->before[warpgroup_id]) {
+      s = apply_buffer_remap_stmt(s);
+    }
+    for (auto &s : new_unit->after[warpgroup_id]) {
+      s = apply_buffer_remap_stmt(s);
+    }
     return new_unit;
+  } else if (node->IsIf()) {
+    if (!node->containWarpgroupId(warpgroup_id) && !ContainsLetDecl(node))
+      return nullptr;
+    auto if_node = static_cast<IfNode *>(node);
+    auto new_if = std::make_shared<IfNode>();
+    new_if->condition = var_remap.empty()
+                            ? if_node->condition
+                            : Substitute(if_node->condition, var_remap);
+    new_if->condition = apply_buffer_remap_expr(new_if->condition);
+    if (if_node->task) {
+      auto cloned_task =
+          std::static_pointer_cast<TaskNode>(if_node->task->Clone());
+      if (!var_remap.empty()) {
+        for (size_t i = 0; i < cloned_task->stmts.size(); ++i) {
+          cloned_task->stmts[i] = Substitute(cloned_task->stmts[i], var_remap);
+        }
+      }
+      apply_buffer_remap_task(cloned_task.get());
+      new_if->task = std::move(cloned_task);
+    }
+    new_if->then_child = CloneIRStructureWithWarpgroupFilter(
+        if_node->then_child.get(), warpgroup_id, var_remap, buffer_remap);
+    if (if_node->else_child) {
+      new_if->else_child = CloneIRStructureWithWarpgroupFilter(
+          if_node->else_child.get(), warpgroup_id, var_remap, buffer_remap);
+    }
+    // Return nullptr if both branches are empty
+    if (!new_if->then_child && !new_if->else_child)
+      return nullptr;
+    return new_if;
   }
   LOG(FATAL);
+  return nullptr;
 }
 
-// Entry point overload — creates a fresh var_remap per call
+std::shared_ptr<IRStructure>
+CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
+                                    Map<Var, PrimExpr> &var_remap) {
+  Map<Buffer, Buffer> buffer_remap;
+  return CloneIRStructureWithWarpgroupFilter(node, warpgroup_id, var_remap,
+                                             buffer_remap);
+}
+
 std::shared_ptr<IRStructure>
 CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id) {
   Map<Var, PrimExpr> var_remap;
-  return CloneIRStructureWithWarpgroupFilter(node, warpgroup_id, var_remap);
+  Map<Buffer, Buffer> buffer_remap;
+  return CloneIRStructureWithWarpgroupFilter(node, warpgroup_id, var_remap,
+                                             buffer_remap);
 }
 
-std::shared_ptr<IRStructure>
-RemoveUnusedLetDecls(std::shared_ptr<IRStructure> root) {
-  if (!root)
-    return nullptr;
-
-  // Phase 1: Collect LetDecl definitions and variable references from
-  // non-LetDecl nodes (task stmts and ScheduleUnit before/after).
-  struct LetDeclEntry {
-    const VarNode *var;
-    PrimExpr value;
-  };
-  std::vector<LetDeclEntry> let_decls;
-  std::unordered_set<const VarNode *> referenced_vars;
-
-  std::function<void(const IRStructure *)> collect =
-      [&](const IRStructure *node) {
-        if (!node)
-          return;
-        if (node->IsTask()) {
-          auto task = static_cast<const TaskNode *>(node);
-          if (IsLetDeclTask(task)) {
-            const auto *let = task->stmts[0].as<LetStmtNode>();
-            let_decls.push_back({let->var.get(), let->value});
-          } else {
-            VarRefCollector collector;
-            for (const auto &stmt : task->stmts) {
-              collector(stmt);
-            }
-            referenced_vars.insert(collector.vars.begin(),
-                                   collector.vars.end());
-          }
-        } else if (node->IsSequence()) {
-          for (const auto &child :
-               static_cast<const SequenceNode *>(node)->children) {
-            collect(child.get());
-          }
-        } else if (node->IsControl()) {
-          auto ctrl = static_cast<const ControlNode *>(node);
-          collect(ctrl->task.get());
-          collect(ctrl->child.get());
-          // Also collect variable references from the For loop bounds
-          // (min, extent, step) so their LetDecls are not removed.
-          VarRefCollector for_collector;
-          for_collector(ctrl->control->min);
-          for_collector(ctrl->control->extent);
-          if (ctrl->control->step.has_value()) {
-            for_collector(ctrl->control->step.value());
-          }
-          referenced_vars.insert(for_collector.vars.begin(),
-                                 for_collector.vars.end());
-        } else if (node->IsWrapper()) {
-          auto wrapper = static_cast<const WrapperNode *>(node);
-          collect(wrapper->task.get());
-          collect(wrapper->child.get());
-          // Also collect variable references from the wrapper statement
-          // (LetStmt value / AttrStmt value) so their LetDecls are not removed.
-          VarRefCollector wrapper_collector;
-          wrapper_collector(wrapper->wrapper);
-          referenced_vars.insert(wrapper_collector.vars.begin(),
-                                 wrapper_collector.vars.end());
-        } else if (node->IsScheduleUnit()) {
-          auto unit = static_cast<const ScheduleUnit *>(node);
-          collect(unit->child.get());
-          VarRefCollector collector;
-          for (const auto &stmts : unit->before) {
-            for (const auto &s : stmts)
-              collector(s);
-          }
-          for (const auto &stmts : unit->after) {
-            for (const auto &s : stmts)
-              collector(s);
-          }
-          referenced_vars.insert(collector.vars.begin(), collector.vars.end());
-        }
-      };
-  collect(root.get());
-
-  // Phase 2: Transitive closure — if a LetDecl var is referenced,
-  // all vars in its value expression are transitively referenced too.
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (const auto &entry : let_decls) {
-      if (referenced_vars.count(entry.var)) {
-        VarRefCollector collector;
-        collector(entry.value);
-        for (const auto *v : collector.vars) {
-          if (!referenced_vars.count(v)) {
-            referenced_vars.insert(v);
-            changed = true;
-          }
-        }
-      }
-    }
+// For each child of a root SequenceNode, apply
+// CloneIRStructureWithWarpgroupFilter individually.
+std::vector<std::shared_ptr<IRStructure>>
+CloneIRStructureChildrenWithWarpgroupFilter(SequenceNode *root_seq,
+                                            int warpgroup_id,
+                                            Map<Var, PrimExpr> &var_remap,
+                                            Map<Buffer, Buffer> &buffer_remap) {
+  std::vector<std::shared_ptr<IRStructure>> result;
+  result.reserve(root_seq->children.size());
+  for (const auto &child : root_seq->children) {
+    result.push_back(CloneIRStructureWithWarpgroupFilter(
+        child.get(), warpgroup_id, var_remap, buffer_remap));
   }
+  return result;
+}
 
-  // Phase 3: Filter the tree — remove LetDecl tasks for unused vars.
-  std::function<std::shared_ptr<IRStructure>(
-      const std::shared_ptr<IRStructure> &)>
-      filter_tree = [&](const std::shared_ptr<IRStructure> &node)
-      -> std::shared_ptr<IRStructure> {
-    if (!node)
-      return nullptr;
-    if (node->IsTask()) {
-      if (IsLetDeclTask(static_cast<const TaskNode *>(node.get()))) {
-        const auto *let = static_cast<const TaskNode *>(node.get())
-                              ->stmts[0]
-                              .as<LetStmtNode>();
-        if (!referenced_vars.count(let->var.get())) {
-          return nullptr; // Remove unused LetDecl
-        }
-      }
-      return node;
-    } else if (node->IsSequence()) {
-      auto seq = static_cast<const SequenceNode *>(node.get());
-      auto new_seq = std::make_shared<SequenceNode>();
-      for (const auto &child : seq->children) {
-        auto filtered = filter_tree(child);
-        if (filtered)
-          new_seq->children.push_back(std::move(filtered));
-      }
-      if (new_seq->children.empty())
-        return nullptr;
-      return new_seq;
-    } else if (node->IsControl()) {
-      auto ctrl = static_cast<const ControlNode *>(node.get());
-      auto new_ctrl = std::make_shared<ControlNode>();
-      new_ctrl->control = ctrl->control;
-      new_ctrl->task = ctrl->task;
-      new_ctrl->SetPromote(ctrl->hasPromote());
-      new_ctrl->child = filter_tree(ctrl->child);
-      if (!new_ctrl->child)
-        return nullptr;
-      return new_ctrl;
-    } else if (node->IsWrapper()) {
-      auto wrapper = static_cast<const WrapperNode *>(node.get());
-      auto new_wrapper = std::make_shared<WrapperNode>();
-      new_wrapper->wrapper = wrapper->wrapper;
-      new_wrapper->task = wrapper->task;
-      new_wrapper->child = filter_tree(wrapper->child);
-      return new_wrapper;
-    } else if (node->IsScheduleUnit()) {
-      auto unit = static_cast<const ScheduleUnit *>(node.get());
-      auto new_unit = std::make_shared<ScheduleUnit>();
-      new_unit->stage = unit->stage;
-      new_unit->before = unit->before;
-      new_unit->after = unit->after;
-      new_unit->child = filter_tree(unit->child);
-      if (!new_unit->child)
-        return nullptr;
-      return new_unit;
+std::vector<std::shared_ptr<IRStructure>>
+CloneIRStructureChildrenWithWarpgroupFilter(SequenceNode *root_seq,
+                                            int warpgroup_id,
+                                            Map<Var, PrimExpr> &var_remap) {
+  Map<Buffer, Buffer> buffer_remap;
+  return CloneIRStructureChildrenWithWarpgroupFilter(root_seq, warpgroup_id,
+                                                     var_remap, buffer_remap);
+}
+
+// Post-pass for the finished auto-schedule Stmt: drop any LetStmt whose bound
+// variable is not referenced in its body, provided the bound value expression
+// is pure (no side-effects beyond `kReadState`).
+class UnusedLetStmtStripper : public StmtExprMutator {
+public:
+  Stmt VisitStmt_(const LetStmtNode *op) final {
+    Stmt new_body = this->VisitStmt(op->body);
+    PrimExpr new_value = this->VisitExpr(op->value);
+
+    auto body_uses_var =
+        UsesVar(new_body, [&](const VarNode *v) { return v == op->var.get(); });
+    bool value_is_pure = SideEffect(new_value) <= CallEffectKind::kReadState;
+
+    if (!body_uses_var && value_is_pure) {
+      return new_body;
     }
-    return node;
-  };
+    if (new_body.same_as(op->body) && new_value.same_as(op->value)) {
+      return GetRef<Stmt>(op);
+    }
+    return LetStmt(op->var, new_value, new_body, op->span);
+  }
+};
 
-  return filter_tree(root);
+Stmt StripUnusedLetStmts(const Stmt &stmt) {
+  UnusedLetStmtStripper stripper;
+  return stripper(stmt);
 }
 
 class SimtCopyDetector : public StmtExprVisitor {
@@ -438,6 +612,44 @@ private:
   bool has_simt_copy_{false};
 };
 
+// Detects whether `stmt` already carries any of the signals that downstream
+// AnnotateWarpGroupRegAlloc (see src/transform/annotate_warp_group_reg_alloc.cc
+// SetMaxNRegCollector) treats as "caller already decided register allocation".
+// If any of these signals is present, the auto-schedule warp-group partitioner
+// must skip its own (240/24-style) set_max_nreg injection so the inner choice
+// is preserved.  The three honored signals are:
+//   1. an explicit tl::set_max_nreg() call,
+//   2. an explicit tl::no_set_max_nreg() opt-out sentinel,
+//   3. an AttrStmt with key attr::kCustomWarpSpecialization.
+class InnerNRegDecisionDetector : public StmtExprVisitor {
+public:
+  static bool Detect(const Stmt &stmt) {
+    InnerNRegDecisionDetector detector;
+    detector.VisitStmt(stmt);
+    return detector.has_decision_;
+  }
+
+private:
+  void VisitStmt_(const EvaluateNode *op) final {
+    if (const CallNode *call = op->value.as<CallNode>()) {
+      if (call->op.same_as(tl::set_max_nreg()) ||
+          call->op.same_as(tl::no_set_max_nreg())) {
+        has_decision_ = true;
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == attr::kCustomWarpSpecialization) {
+      has_decision_ = true;
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  bool has_decision_{false};
+};
+
 Stmt ConvertIRStructureToStmt(IRStructure *structure,
                               const bool outer_enable_epi) {
   if (!structure) {
@@ -458,7 +670,7 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure,
     std::vector<Stmt> stmts;
     for (const auto &child : seq->children) {
       auto unit = static_cast<ScheduleUnit *>(child.get());
-      for (auto &before : unit->before) {
+      for (auto &[_, before] : unit->before) {
         for (auto &stmt : before) {
           stmts.push_back(stmt);
         }
@@ -466,7 +678,7 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure,
       Stmt child_stmt =
           ConvertIRStructureToStmt(unit->child.get(), outer_enable_epi);
       stmts.push_back(child_stmt);
-      for (auto &after : unit->after) {
+      for (auto &[_, after] : unit->after) {
         for (auto &stmt : after) {
           stmts.push_back(stmt);
         }
@@ -496,14 +708,14 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure,
       std::vector<Stmt> stmts;
       if (ctrl->child->IsScheduleUnit()) {
         auto unit = static_cast<ScheduleUnit *>(ctrl->child.get());
-        for (auto &before : unit->before) {
+        for (auto &[_, before] : unit->before) {
           for (auto &stmt : before) {
             stmts.push_back(stmt);
           }
         }
         stmts.push_back(
             ConvertIRStructureToStmt(unit->child.get(), outer_enable_epi));
-        for (auto &after : unit->after) {
+        for (auto &[_, after] : unit->after) {
           for (auto &stmt : after) {
             stmts.push_back(stmt);
           }
@@ -513,19 +725,22 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure,
         for (auto &child : seq->children) {
           ICHECK(child->IsScheduleUnit());
           auto unit = static_cast<ScheduleUnit *>(child.get());
-          for (auto &before : unit->before) {
+          for (auto &[_, before] : unit->before) {
             for (auto &stmt : before) {
               stmts.push_back(stmt);
             }
           }
           stmts.push_back(
               ConvertIRStructureToStmt(unit->child.get(), outer_enable_epi));
-          for (auto &after : unit->after) {
+          for (auto &[_, after] : unit->after) {
             for (auto &stmt : after) {
               stmts.push_back(stmt);
             }
           }
         }
+      } else if (ctrl->child->IsTask()) {
+        auto task = static_cast<TaskNode *>(ctrl->child.get());
+        stmts.push_back(ConvertIRStructureToStmt(task, outer_enable_epi));
       } else {
         LOG(FATAL);
       }
@@ -543,57 +758,24 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure,
     for (auto &child : seq->children) {
       auto unit = static_cast<ScheduleUnit *>(child.get());
       std::vector<Stmt> stmts;
-      for (auto &before : unit->before) {
-        for (auto &stmt : before) {
+      for (const auto &[_, before] : unit->before) {
+        for (const auto &stmt : before) {
           stmts.push_back(stmt);
         }
       }
       stmts.push_back(
           ConvertIRStructureToStmt(unit->child.get(), outer_enable_epi));
-      for (auto &after : unit->after) {
-        for (auto &stmt : after) {
+      for (const auto &[_, after] : unit->after) {
+        for (const auto &stmt : after) {
           stmts.push_back(stmt);
         }
       }
       unit_stages[unit->stage - min_stages].push_back(SeqStmt::Flatten(stmts));
     }
-    // Check if any task in this control node contains loop_break
-    // If any task contains loop_break, disable prologue
-    std::function<bool(IRStructure *)> check_contains_loop_break;
-    check_contains_loop_break =
-        [&check_contains_loop_break](IRStructure *structure) -> bool {
-      if (!structure)
-        return false;
-
-      if (structure->IsTask()) {
-        auto task = static_cast<TaskNode *>(structure);
-        return task->ContainsLoopBreak();
-      } else if (structure->IsSequence()) {
-        auto seq = static_cast<SequenceNode *>(structure);
-        for (const auto &child : seq->children) {
-          auto unit = static_cast<ScheduleUnit *>(child.get());
-          if (check_contains_loop_break(unit->child.get())) {
-            return true;
-          }
-        }
-        return false;
-      } else if (structure->IsScheduleUnit()) {
-        auto unit = static_cast<ScheduleUnit *>(structure);
-        return check_contains_loop_break(unit->child.get());
-      } else if (structure->IsControl()) {
-        auto ctrl = static_cast<ControlNode *>(structure);
-        return check_contains_loop_break(ctrl->child.get());
-      } else if (structure->IsWrapper()) {
-        auto wrapper = static_cast<WrapperNode *>(structure);
-        return check_contains_loop_break(wrapper->child.get());
-      }
-      return false;
-    };
-
     // Set enable_pro to true only if:
-    // 1. No task contains loop_break
+    // 1. No node contains loop_break
     // 2. Loop boundaries (min and extent) are constants
-    bool enable_pro = !check_contains_loop_break(ctrl->child.get());
+    bool enable_pro = !(ctrl->child && ctrl->child->ContainsLoopBreak());
 
     // Check if loop boundaries are constants
     bool loop_min_is_const = tir::is_const_int(loop_start);
@@ -603,24 +785,21 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure,
       enable_pro = false;
     }
 
-    bool enable_epi = outer_enable_epi && enable_pro;
+    bool enable_epi = enable_pro;
+
+    // Read num_stages from loop annotation for prologue extent
+    int num_stages_annotation = max_stages - min_stages;
+    auto num_stages_val = ctrl->control.get()->annotations.Get("num_stages");
+    if (num_stages_val.has_value()) {
+      num_stages_annotation = num_stages_val.value().cast<IntImm>()->value;
+    }
+    int prologue_extent = 2 * num_stages_annotation;
+    int epilogue_extent = max_stages - min_stages;
+
     std::vector<Stmt> steady;
 
     for (auto &child : seq->children) {
       auto unit = static_cast<ScheduleUnit *>(child.get());
-      std::vector<Stmt> stmts;
-      for (auto &before : unit->before) {
-        for (auto &stmt : before) {
-          stmts.push_back(stmt);
-        }
-      }
-      stmts.push_back(
-          ConvertIRStructureToStmt(unit->child.get(), outer_enable_epi));
-      for (auto &after : unit->after) {
-        for (auto &stmt : after) {
-          stmts.push_back(stmt);
-        }
-      }
       Map<Var, PrimExpr> substitution, substitution_cond;
       substitution.Set(loop_var,
                        loop_var - loop_step * (max_stages - unit->stage));
@@ -628,17 +807,45 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure,
           loop_var, Max(loop_start, Min(loop_start + loop_extent - loop_step,
                                         loop_var - loop_step * (max_stages -
                                                                 unit->stage))));
+      PrimExpr condition =
+          And(loop_var < loop_start + loop_extent, loop_var >= loop_start);
+      if (unit->stage == min_stages) {
+        condition = loop_var >= loop_start;
+      }
+      if (unit->stage == max_stages) {
+        condition = loop_var < loop_start + loop_extent;
+      }
       if (IsLetDeclNode(unit->child.get())) {
-        Stmt stmt = SeqStmt::Flatten(stmts);
-        steady.push_back(Substitute(stmt, substitution_cond));
-      } else {
-        PrimExpr condition =
-            And(loop_var < loop_start + loop_extent, loop_var >= loop_start);
-        if (unit->stage == min_stages) {
-          condition = loop_var >= loop_start;
+        std::vector<Stmt> guarded;
+        for (const auto &[_, before] : unit->before) {
+          for (const auto &stmt : before) {
+            guarded.push_back(
+                Substitute(IfThenElse(condition, stmt), substitution));
+          }
         }
-        if (unit->stage == max_stages) {
-          condition = loop_var < loop_start + loop_extent;
+        guarded.push_back(Substitute(
+            ConvertIRStructureToStmt(unit->child.get(), outer_enable_epi),
+            substitution_cond));
+        for (const auto &[_, after] : unit->after) {
+          for (const auto &stmt : after) {
+            guarded.push_back(
+                Substitute(IfThenElse(condition, stmt), substitution));
+          }
+        }
+        steady.push_back(SeqStmt::Flatten(guarded));
+      } else {
+        std::vector<Stmt> stmts;
+        for (const auto &[_, before] : unit->before) {
+          for (const auto &stmt : before) {
+            stmts.push_back(stmt);
+          }
+        }
+        stmts.push_back(
+            ConvertIRStructureToStmt(unit->child.get(), outer_enable_epi));
+        for (const auto &[_, after] : unit->after) {
+          for (const auto &stmt : after) {
+            stmts.push_back(stmt);
+          }
         }
         Stmt stmt = IfThenElse(condition, SeqStmt::Flatten(stmts));
         steady.push_back(Substitute(stmt, substitution));
@@ -666,11 +873,12 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure,
       new_for.CopyOnWrite()->loop_var = pro;
       new_for.CopyOnWrite()->kind = ForKind::kUnrolled;
       new_for.CopyOnWrite()->extent =
-          min(max_stages - min_stages, for_op.get()->extent);
-      for_op.CopyOnWrite()->min += loop_step * (max_stages - min_stages);
+          min(prologue_extent, for_op.get()->extent);
+      for_op.CopyOnWrite()->min += loop_step * prologue_extent;
       for_op.CopyOnWrite()->extent =
-          max(0, for_op.get()->extent - (max_stages - min_stages));
+          max(0, for_op.get()->extent - prologue_extent);
       prologue = Substitute(new_for, sub);
+      prologue = RenameLetStmtVars(prologue, "_prologue");
     }
     Stmt epilogue = Evaluate(0);
     if (enable_epi) {
@@ -682,12 +890,13 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure,
       new_for.CopyOnWrite()->kind = ForKind::kUnrolled;
       new_for.CopyOnWrite()->min =
           for_op.get()->min +
-          loop_step * (for_op.get()->extent - (max_stages - min_stages));
+          loop_step * (for_op.get()->extent - epilogue_extent);
       new_for.CopyOnWrite()->extent =
-          min(max_stages - min_stages, for_op.get()->extent);
+          min(epilogue_extent, for_op.get()->extent);
       for_op.CopyOnWrite()->extent =
-          max(0, for_op.get()->extent - (max_stages - min_stages));
+          max(0, for_op.get()->extent - epilogue_extent);
       epilogue = Substitute(new_for, sub);
+      epilogue = RenameLetStmtVars(epilogue, "_epilogue");
     }
     return SeqStmt({prologue, for_op, epilogue});
   } else if (structure->IsWrapper()) {
@@ -703,6 +912,16 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure,
     } else {
       LOG(FATAL);
     }
+  } else if (structure->IsIf()) {
+    auto if_node = static_cast<const IfNode *>(structure);
+    Stmt then_stmt =
+        ConvertIRStructureToStmt(if_node->then_child.get(), outer_enable_epi);
+    Optional<Stmt> else_stmt;
+    if (if_node->else_child) {
+      else_stmt =
+          ConvertIRStructureToStmt(if_node->else_child.get(), outer_enable_epi);
+    }
+    return IfThenElse(if_node->condition, then_stmt, else_stmt);
   }
 
   LOG(FATAL)
@@ -714,8 +933,9 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure,
 Stmt ApplyWarpgroupPartitionToIRStructure(
     IRStructure *root, IterVar thread_var, std::vector<Buffer> &barrier_buffers,
     Map<ObjectRef, ObjectRef> &barrier_map, const bool outer_enable_epi,
-    PrimExpr thread_count[2], bool producer_consumer,
-    const WarpSpecializeConfig &config, Buffer neutral_sync_shared_barrier) {
+    const std::vector<PrimExpr> &thread_count,
+    const WarpSpecializeConfig &config, Buffer neutral_sync_shared_barrier,
+    std::vector<Buffer> &duplicated_fragment_buffers) {
   if (!root)
     return Evaluate(0);
 
@@ -725,8 +945,8 @@ Stmt ApplyWarpgroupPartitionToIRStructure(
     if (wrapper->child) {
       body = ApplyWarpgroupPartitionToIRStructure(
           wrapper->child.get(), thread_var, barrier_buffers, barrier_map,
-          outer_enable_epi, thread_count, producer_consumer, config,
-          neutral_sync_shared_barrier);
+          outer_enable_epi, thread_count, config, neutral_sync_shared_barrier,
+          duplicated_fragment_buffers);
     }
     if (const auto *let = wrapper->wrapper.as<LetStmtNode>()) {
       return LetStmt(let->var, let->value, body);
@@ -734,80 +954,15 @@ Stmt ApplyWarpgroupPartitionToIRStructure(
       return AttrStmt(attr->node, attr->attr_key, attr->value, body);
     } else {
       LOG(FATAL);
+      return Evaluate(0);
     }
   }
 
-  // Check if there are tasks with mixed warpgroup ids
-  std::vector<TaskNodeWithContext> all_tasks;
-  CollectAllTaskNodesWithContext(root, all_tasks);
-
-  bool has_warpgroup0 = false;
-  bool has_warpgroup1 = false;
-  bool has_warpgroup_neutral = false;
-  for (auto &task : all_tasks) {
-    int wg_id = task.task->GetWarpgroupId();
-    if (wg_id == 0)
-      has_warpgroup0 = true;
-    else if (wg_id == 1)
-      has_warpgroup1 = true;
-    else if (wg_id == -1)
-      has_warpgroup_neutral = true;
-  }
-
-  // If all tasks belong to the same warpgroup, no partition needed
-  if (!(has_warpgroup0 && has_warpgroup1)) {
-    return ConvertIRStructureToStmt(root, outer_enable_epi);
-  }
-
-  // Helper function to clone IRStructure filtering tasks with warpgroup_id ==
-  // -1 (neutral tasks)
-  std::function<std::shared_ptr<IRStructure>(IRStructure *)>
-      clone_neutral_filter;
-  clone_neutral_filter =
-      [&clone_neutral_filter](
-          IRStructure *node) -> std::shared_ptr<IRStructure> {
-    if (!node)
-      return nullptr;
-
-    if (node->IsTask()) {
-      auto task = static_cast<TaskNode *>(node);
-      if (task->GetWarpgroupId() == -1) {
-        return task->Clone();
-      } else {
-        auto new_task = std::make_shared<TaskNode>();
-        // Empty statements
-        return new_task;
-      }
-    } else if (node->IsSequence()) {
-      auto seq = static_cast<SequenceNode *>(node);
-      auto new_seq = std::make_shared<SequenceNode>();
-      for (const auto &child : seq->children) {
-        if (child) {
-          auto node = static_cast<ScheduleUnit *>(child.get());
-          auto new_node = clone_neutral_filter(node->child.get());
-          if (new_node) {
-            auto new_unit = std::make_shared<ScheduleUnit>();
-            new_unit->child = std::move(new_node);
-            new_seq->children.push_back(std::move(new_unit));
-          }
-        }
-      }
-      return new_seq;
-    } else if (node->IsWrapper()) {
-      auto wrapper = static_cast<WrapperNode *>(node);
-      auto new_wrapper = std::make_shared<WrapperNode>();
-      new_wrapper->child = clone_neutral_filter(wrapper->child.get());
-      if (new_wrapper->child) {
-        return new_wrapper;
-      }
-      return nullptr;
-    } else if (node->IsControl()) {
-      return nullptr;
-    }
-    LOG(FATAL);
-  };
+  size_t num_wgs = thread_count.size();
 
   auto has_actual_statements = [](IRStructure *node) -> bool {
+    if (!node)
+      return false;
     std::vector<TaskNodeWithContext> tasks;
     CollectAllTaskNodesWithContext(node, tasks);
     for (auto &task : tasks) {
@@ -818,154 +973,115 @@ Stmt ApplyWarpgroupPartitionToIRStructure(
     return false;
   };
 
-  std::function<std::shared_ptr<IRStructure>(
-      IRStructure *, const std::function<bool(int)> &, int)>
-      clone_neutral_filter_with_top_level;
-  clone_neutral_filter_with_top_level =
-      [&clone_neutral_filter_with_top_level, &clone_neutral_filter](
-          IRStructure *node, const std::function<bool(int)> &include_top_level,
-          int top_level_index) -> std::shared_ptr<IRStructure> {
+  std::function<std::shared_ptr<IRStructure>(IRStructure *, SchedulePhase)>
+      clone_phase_filter;
+  clone_phase_filter =
+      [&clone_phase_filter](
+          IRStructure *node,
+          SchedulePhase phase) -> std::shared_ptr<IRStructure> {
     if (!node)
       return nullptr;
 
     if (node->IsTask()) {
-      if (include_top_level(top_level_index)) {
-        return clone_neutral_filter(node);
+      auto task = static_cast<TaskNode *>(node);
+      if (task->GetSchedulePhase() == phase) {
+        return task->Clone();
       } else {
         auto new_task = std::make_shared<TaskNode>();
-        // Empty statements
         return new_task;
       }
     } else if (node->IsSequence()) {
       auto seq = static_cast<SequenceNode *>(node);
       auto new_seq = std::make_shared<SequenceNode>();
-      int child_index = 0;
       for (const auto &child : seq->children) {
         if (child) {
           auto schedule_unit = static_cast<ScheduleUnit *>(child.get());
-          int next_top_level_index =
-              top_level_index == -1 ? child_index : top_level_index;
-          auto new_node = clone_neutral_filter_with_top_level(
-              schedule_unit->child.get(), include_top_level,
-              next_top_level_index);
+          auto new_node = clone_phase_filter(schedule_unit->child.get(), phase);
           if (new_node) {
             auto new_unit = std::make_shared<ScheduleUnit>();
             new_unit->child = std::move(new_node);
             new_seq->children.push_back(std::move(new_unit));
           }
         }
-        child_index++;
       }
       return new_seq;
     } else if (node->IsWrapper()) {
       auto wrapper = static_cast<WrapperNode *>(node);
       auto new_wrapper = std::make_shared<WrapperNode>();
-      new_wrapper->child = clone_neutral_filter_with_top_level(
-          wrapper->child.get(), include_top_level, top_level_index);
+      new_wrapper->child = clone_phase_filter(wrapper->child.get(), phase);
       if (new_wrapper->child) {
         return new_wrapper;
       }
       return nullptr;
     } else if (node->IsControl()) {
       return nullptr;
+    } else if (node->IsIf()) {
+      return nullptr;
     }
     LOG(FATAL);
+    return nullptr;
   };
 
-  // Determine which top-level neutral children should be epi (run after
-  // warpgroup-partitioned code). A neutral child is epi if it directly or
-  // transitively depends on warpgroup task output.
-  std::unordered_set<const Object *> wg_write_buffers;
-  std::unordered_set<int> depends_on_wg_output;
-  // Per-child write buffers and read buffers for neutral children
-  struct ChildBufferInfo {
-    std::unordered_set<const Object *> read_bufs;
-    std::unordered_set<const Object *> write_bufs;
-    bool all_neutral = true;
-  };
-  std::vector<ChildBufferInfo> child_infos;
-  if (root->IsSequence()) {
-    auto seq = static_cast<SequenceNode *>(root);
-    child_infos.resize(seq->children.size());
-    for (size_t i = 0; i < seq->children.size(); ++i) {
-      const auto &child = seq->children[i];
-      if (!child)
-        continue;
-      auto unit = static_cast<ScheduleUnit *>(child.get());
-      std::vector<TaskNodeWithContext> child_tasks;
-      CollectAllTaskNodesWithContext(unit->child.get(), child_tasks);
-      auto &info = child_infos[i];
-      for (const auto &task : child_tasks) {
-        if (task.task->GetWarpgroupId() >= 0) {
-          info.all_neutral = false;
-          for (const auto &wr : task.task->GetWriteRegions())
-            wg_write_buffers.insert(wr->buffer.get());
-        }
-        for (const auto &rd : task.task->GetReadRegions())
-          info.read_bufs.insert(rd->buffer.get());
-        for (const auto &wr : task.task->GetWriteRegions())
-          info.write_bufs.insert(wr->buffer.get());
-      }
-    }
-    // Transitive fixpoint: if a neutral child reads from wg_write_buffers,
-    // mark it as epi and add its write buffers to wg_write_buffers so that
-    // other neutral children that depend on it are also marked epi.
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      for (size_t i = 0; i < child_infos.size(); ++i) {
-        if (!child_infos[i].all_neutral)
-          continue;
-        if (depends_on_wg_output.count(static_cast<int>(i)))
-          continue;
-        for (const auto *buf : child_infos[i].read_bufs) {
-          if (wg_write_buffers.count(buf)) {
-            depends_on_wg_output.insert(static_cast<int>(i));
-            for (const auto *wb : child_infos[i].write_bufs)
-              wg_write_buffers.insert(wb);
-            changed = true;
-            break;
-          }
-        }
+  auto wg_pro_neutral_structure =
+      clone_phase_filter(root, SchedulePhase::kPrologue);
+  auto wg_epi_neutral_structure =
+      clone_phase_filter(root, SchedulePhase::kEpilogue);
+  // wg_children[wg_id][child_index] = filtered IRStructure (nullptr if absent)
+  std::vector<std::vector<std::shared_ptr<IRStructure>>> wg_children(num_wgs);
+  std::vector<std::shared_ptr<IRStructure>> wg_structures(num_wgs);
+
+  std::vector<Buffer> broadcast_fragments =
+      CollectBroadcastFragmentBuffers(root);
+  std::vector<Map<Buffer, Buffer>> per_wg_buffer_remap(num_wgs);
+  if (!broadcast_fragments.empty()) {
+    for (size_t i = 1; i < num_wgs; ++i) {
+      std::string suffix = "_wg" + std::to_string(i);
+      for (const auto &buf : broadcast_fragments) {
+        Buffer new_buf = DuplicateFragmentBuffer(buf, suffix);
+        per_wg_buffer_remap[i].Set(buf, new_buf);
+        duplicated_fragment_buffers.push_back(new_buf);
       }
     }
   }
 
-  auto is_epi_top_level_index = [&depends_on_wg_output](int top_level_index) {
-    return depends_on_wg_output.count(top_level_index) > 0;
-  };
-  auto is_pro_top_level_index = [is_epi_top_level_index](int top_level_index) {
-    return !is_epi_top_level_index(top_level_index);
-  };
+  if (root->IsSequence()) {
+    auto root_seq = static_cast<SequenceNode *>(root);
+    for (size_t i = 0; i < num_wgs; ++i) {
+      Map<Var, PrimExpr> var_remap;
+      wg_children[i] = CloneIRStructureChildrenWithWarpgroupFilter(
+          root_seq, i, var_remap, per_wg_buffer_remap[i]);
+    }
+    for (size_t i = 0; i < num_wgs; ++i) {
+      // Rebuild from wg_children: wrap non-null children into a SequenceNode
+      auto rebuilt_seq = std::make_shared<SequenceNode>();
+      for (const auto &child : wg_children[i]) {
+        if (child)
+          rebuilt_seq->children.push_back(child);
+      }
+      wg_structures[i] = rebuilt_seq->children.empty() ? nullptr : rebuilt_seq;
+    }
+  } else {
+    // Fallback for non-SequenceNode root: clone entire root per warpgroup.
+    for (size_t i = 0; i < num_wgs; ++i) {
+      Map<Var, PrimExpr> var_remap;
+      wg_structures[i] = CloneIRStructureWithWarpgroupFilter(
+          root, i, var_remap, per_wg_buffer_remap[i]);
+    }
+  }
 
-  auto wg_pro_neutral_structure = has_warpgroup_neutral
-                                      ? clone_neutral_filter_with_top_level(
-                                            root, is_pro_top_level_index, -1)
-                                      : nullptr;
-  auto wg_epi_neutral_structure = has_warpgroup_neutral
-                                      ? clone_neutral_filter_with_top_level(
-                                            root, is_epi_top_level_index, -1)
-                                      : nullptr;
-
-  auto wg0_structure =
-      RemoveUnusedLetDecls(CloneIRStructureWithWarpgroupFilter(root, 0));
-  auto wg1_structure =
-      RemoveUnusedLetDecls(CloneIRStructureWithWarpgroupFilter(root, 1));
+  std::vector<PrimExpr> wg_conditions(num_wgs);
+  wg_conditions[0] = thread_count[0];
+  for (size_t i = 1; i < num_wgs; ++i) {
+    wg_conditions[i] = wg_conditions[i - 1] + thread_count[i];
+  }
+  for (auto &cond : wg_conditions) {
+    cond = thread_var->var < cond;
+  }
 
   bool wg_pro_neutral_has_stmts =
-      wg_pro_neutral_structure
-          ? has_actual_statements(wg_pro_neutral_structure.get())
-          : false;
+      has_actual_statements(wg_pro_neutral_structure.get());
   bool wg_epi_neutral_has_stmts =
-      wg_epi_neutral_structure
-          ? has_actual_statements(wg_epi_neutral_structure.get())
-          : false;
-  bool wg0_has_stmts = has_actual_statements(wg0_structure.get());
-  bool wg1_has_stmts = has_actual_statements(wg1_structure.get());
-
-  PrimExpr condition = thread_var->var < thread_count[0];
-  PrimExpr wg1_condition =
-      thread_var->var < (thread_count[0] + thread_count[1]);
+      has_actual_statements(wg_epi_neutral_structure.get());
 
   Stmt pro_neutral_body =
       wg_pro_neutral_has_stmts
@@ -978,316 +1094,410 @@ Stmt ApplyWarpgroupPartitionToIRStructure(
                                      outer_enable_epi)
           : Evaluate(0);
 
-  // --- Segment the wg0/wg1 structures by ControlNode (for-loop) boundaries ---
-  // This produces multiple IfThenElse blocks separated by liveness boundary
-  // markers, so that the merge-shared-memory pass can reuse buffers across
-  // segments whose lifetimes do not overlap.
-
-  // Helper: segment a top-level SequenceNode's children into groups separated
-  // by ControlNode boundaries. Each ControlNode becomes its own segment;
-  // consecutive non-ControlNode children are grouped together.
-  auto SegmentSequenceChildren = [](IRStructure *structure)
-      -> std::vector<std::vector<std::shared_ptr<IRStructure>>> {
-    std::vector<std::vector<std::shared_ptr<IRStructure>>> segments;
-    if (!structure || !structure->IsSequence()) {
-      return segments;
+  // Helper: build a single IfThenElse (with wg nesting) from per-wg Stmts.
+  auto MakeWarpgroupIf =
+      [&wg_conditions](const std::vector<Stmt> &wg_stmts) -> Stmt {
+    Stmt if_then_else = Evaluate(0);
+    for (size_t i = wg_stmts.size(); i-- > 0;) {
+      if_then_else = IfThenElse(wg_conditions[i], wg_stmts[i], if_then_else);
     }
-    auto seq = static_cast<SequenceNode *>(structure);
-
-    std::vector<std::shared_ptr<IRStructure>> current;
-    for (auto &child : seq->children) {
-      auto unit = static_cast<ScheduleUnit *>(child.get());
-      if (unit->child && unit->child->IsControl()) {
-        if (!current.empty()) {
-          segments.push_back(std::move(current));
-          current = {};
-        }
-        segments.push_back({child});
-      } else {
-        current.push_back(child);
-      }
-    }
-    if (!current.empty()) {
-      segments.push_back(std::move(current));
-    }
-
-    return segments;
+    return if_then_else;
   };
 
-  // Helper: wrap a list of ScheduleUnit children back into a temporary
-  // SequenceNode and convert to Stmt.
-  auto SegmentToStmt =
-      [outer_enable_epi](
-          const std::vector<std::shared_ptr<IRStructure>> &children) -> Stmt {
-    if (children.empty())
-      return Evaluate(0);
-    // Even for a single child we go through the SequenceNode path so that
-    // ScheduleUnit before/after stmts are emitted correctly.
-    auto tmp_seq = std::make_shared<SequenceNode>();
-    tmp_seq->children = children;
-    return ConvertIRStructureToStmt(tmp_seq.get(), outer_enable_epi);
-  };
+  // Check for SIMT copy in wg1 (needed for set_max_nreg decision).
+  bool has_simt_copy = false;
+  if (num_wgs == 2 && wg_structures[1]) {
+    Stmt full_wg1 =
+        ConvertIRStructureToStmt(wg_structures[1].get(), outer_enable_epi);
+    has_simt_copy = SimtCopyDetector::Detect(full_wg1);
+  }
 
-  // Helper: build a single IfThenElse (with wg1 nesting) from a pair of Stmts.
-  auto MakeWarpgroupIf = [&condition, &wg1_condition](Stmt wg0_stmt,
-                                                      Stmt wg1_stmt) -> Stmt {
-    bool wg0_valid = !IsEvaluateZero(wg0_stmt);
-    bool wg1_valid = !IsEvaluateZero(wg1_stmt);
-    if (wg0_valid && wg1_valid) {
-      return IfThenElse(condition, wg0_stmt,
-                        IfThenElse(wg1_condition, wg1_stmt, Evaluate(0)));
-    } else if (wg0_valid) {
-      return IfThenElse(condition, wg0_stmt);
-    } else if (wg1_valid) {
-      return IfThenElse(wg1_condition, wg1_stmt);
-    }
-    return Evaluate(0);
-  };
-
-  // Helper: collect LetDecl {Var, PrimExpr} pairs from a segment's children.
-  // Returns them in order of appearance, which is the order they must be
-  // nested.
-  auto CollectLetDeclInfo =
-      [](const std::vector<std::shared_ptr<IRStructure>> &children)
-      -> std::vector<std::pair<Var, PrimExpr>> {
-    std::vector<std::pair<Var, PrimExpr>> result;
-    for (auto &child : children) {
-      auto unit = static_cast<ScheduleUnit *>(child.get());
-      IRStructure *inner = unit->child.get();
-      // Handle ScheduleUnit wrapping a TaskNode
-      if (inner && inner->IsTask()) {
-        auto task = static_cast<TaskNode *>(inner);
-        if (IsLetDeclTask(task)) {
-          const auto *let = task->stmts[0].as<LetStmtNode>();
-          result.push_back({let->var, let->value});
-        }
+  // Check whether any inner pass already decided register allocation.
+  bool has_inner_nreg_decision = false;
+  if (num_wgs == 2 && config.enable_set_max_nreg) {
+    for (size_t i = 0; i < num_wgs; ++i) {
+      if (!wg_structures[i]) {
+        continue;
+      }
+      Stmt full_wg =
+          ConvertIRStructureToStmt(wg_structures[i].get(), outer_enable_epi);
+      if (InnerNRegDecisionDetector::Detect(full_wg)) {
+        has_inner_nreg_decision = true;
+        break;
       }
     }
-    return result;
-  };
+  }
 
-  // Helper: given a Stmt and accumulated LetDecl pairs from previous segments,
-  // create fresh variables with copy_with_suffix, substitute all references
-  // in the Stmt, and wrap with LetStmt bindings.  Variables that are not
-  // referenced in the body (or in kept variables' value expressions) are
-  // pruned to avoid dead declarations.
-  auto WrapWithRenamedLetDecls =
-      [](Stmt body,
-         const std::vector<std::pair<Var, PrimExpr>> &accumulated_lets)
-      -> Stmt {
-    if (accumulated_lets.empty())
-      return body;
-
-    // Build substitution map: old_var -> new_var
-    Map<Var, PrimExpr> subst_map;
-    // Create fresh vars and accumulate them (in order)
-    std::vector<std::pair<Var, PrimExpr>> new_lets;
-    for (auto &[old_var, old_value] : accumulated_lets) {
-      auto new_var = old_var.copy_with_suffix("");
-      subst_map.Set(old_var, new_var);
-      PrimExpr new_value = Substitute(old_value, subst_map);
-      new_lets.push_back({new_var, new_value});
-    }
-
-    // Substitute all references in the body
-    body = Substitute(body, subst_map);
-
-    // Determine which variables are actually used.  Walk from innermost to
-    // outermost: a variable is "needed" if it appears in the body or in any
-    // already-needed variable's value expression.
-    std::vector<bool> needed(new_lets.size(), false);
-    // Start with variables used directly in the body.
-    for (size_t i = 0; i < new_lets.size(); ++i) {
-      const Var &v = new_lets[i].first;
-      if (UsesVar(body,
-                  [&v](const VarNode *node) { return node == v.get(); })) {
-        needed[i] = true;
-      }
-    }
-    // Propagate: if variable j is needed and its value uses variable i,
-    // then i is also needed.  Iterate until fixpoint.
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      for (size_t j = 0; j < new_lets.size(); ++j) {
-        if (!needed[j])
-          continue;
-        for (size_t i = 0; i < j; ++i) {
-          if (needed[i])
-            continue;
-          const Var &vi = new_lets[i].first;
-          if (UsesVar(new_lets[j].second, [&vi](const VarNode *node) {
-                return node == vi.get();
-              })) {
-            needed[i] = true;
-            changed = true;
-          }
-        }
-      }
-    }
-
-    // Wrap only needed LetStmt bindings (innermost first)
-    for (int i = static_cast<int>(new_lets.size()) - 1; i >= 0; --i) {
-      if (needed[i]) {
-        body = LetStmt(new_lets[i].first, new_lets[i].second, body);
-      }
-    }
-    return body;
-  };
+  // --- Per-child construction ---
+  // Walk root SequenceNode's children.  LetDecl children are normally
+  // accumulated as (var, value, before_stmts, after_stmts) tuples so that the
+  // cloned before/after barriers on their ScheduleUnit are preserved.  When
+  // wrapping a subsequent non-LetDecl child, each accumulated tuple is
+  // re-emitted as
+  //     <before_stmts> ; let var = value in (<after_stmts> ; body)
+  // so the barrier pair brackets the let binding while `var` stays in scope
+  // for the rest of the segment.
 
   Stmt if_then_else;
-  if (wg0_has_stmts && wg1_has_stmts) {
-    auto wg0_segments = SegmentSequenceChildren(wg0_structure.get());
-    auto wg1_segments = SegmentSequenceChildren(wg1_structure.get());
+  if (root->IsSequence()) {
+    auto root_seq = static_cast<SequenceNode *>(root);
+    size_t num_children = root_seq->children.size();
 
-    // Helper: extract the For loop_var pointer from a Control segment
-    // (a segment with exactly one ScheduleUnit whose child is a ControlNode).
-    auto GetControlLoopVar =
-        [](const std::vector<std::shared_ptr<IRStructure>> &seg)
-        -> const VarNode * {
-      if (seg.size() != 1)
-        return nullptr;
-      auto unit = static_cast<ScheduleUnit *>(seg[0].get());
-      if (!unit->child || !unit->child->IsControl())
-        return nullptr;
-      auto ctrl = static_cast<ControlNode *>(unit->child.get());
-      return ctrl->control->loop_var.get();
-    };
-
-    auto MergeNonControlSegments =
-        [&GetControlLoopVar](
-            std::vector<std::vector<std::shared_ptr<IRStructure>>> &segments) {
-          std::vector<std::vector<std::shared_ptr<IRStructure>>> merged;
-          std::vector<std::shared_ptr<IRStructure>> pending;
-          for (auto &seg : segments) {
-            auto lv = GetControlLoopVar(seg);
-            if (lv) {
-              // Control segment: prepend any pending non-Control children
-              merged.push_back(std::move(pending));
-              merged.push_back(std::move(seg));
-              pending.clear();
-            } else {
-              // Non-Control segment: accumulate for merging
-              pending.insert(pending.end(),
-                             std::make_move_iterator(seg.begin()),
-                             std::make_move_iterator(seg.end()));
-            }
-          }
-          // Trailing non-Control segments: append to last merged segment
-          merged.push_back(std::move(pending));
-          segments = std::move(merged);
-        };
-
-    MergeNonControlSegments(wg0_segments);
-    MergeNonControlSegments(wg1_segments);
-
-    ICHECK_EQ(wg0_segments.size(), wg1_segments.size())
-        << "Segment count mismatch between wg0 and wg1 after merging "
-           "non-Control segments";
-
-    // Apply segmented splitting
-    std::vector<Stmt> segmented_stmts;
-    bool has_simt_copy = false;
-    // Check for SIMT copy in any wg1 segment (needed for set_max_nreg
-    // decision).
-    {
-      Stmt full_wg1 =
-          ConvertIRStructureToStmt(wg1_structure.get(), outer_enable_epi);
-      has_simt_copy = SimtCopyDetector::Detect(full_wg1);
+    std::vector<std::unordered_set<const BufferNode *>> child_read_bufs(
+        num_children);
+    std::vector<std::unordered_set<const BufferNode *>> child_write_bufs(
+        num_children);
+    std::vector<std::unordered_set<const VarNode *>> child_read_vars(
+        num_children);
+    std::vector<std::unordered_set<const VarNode *>> child_write_vars(
+        num_children);
+    for (size_t ci = 0; ci < num_children; ++ci) {
+      IRStructure *c = root_seq->children[ci].get();
+      if (!c)
+        continue;
+      for (const auto &r : c->GetReadRegions()) {
+        child_read_bufs[ci].insert(r->buffer.get());
+      }
+      for (const auto &r : c->GetWriteRegions()) {
+        child_write_bufs[ci].insert(r->buffer.get());
+      }
+      for (const auto &v : c->GetReadVars()) {
+        child_read_vars[ci].insert(v.get());
+      }
+      for (const auto &v : c->GetWriteVars()) {
+        child_write_vars[ci].insert(v.get());
+      }
     }
 
-    // Accumulate LetDecl info from previous segments for variable renaming.
-    std::vector<std::pair<Var, PrimExpr>> wg0_accumulated_lets;
-    std::vector<std::pair<Var, PrimExpr>> wg1_accumulated_lets;
+    std::vector<int> anchor_end(num_children, -1);
+    for (size_t i = 0; i < num_children; ++i) {
+      auto unit_i = static_cast<ScheduleUnit *>(root_seq->children[i].get());
+      if (!unit_i || !IsLetDeclNode(unit_i->child.get()))
+        continue;
+      const auto &rb = child_read_bufs[i];
+      const auto &rv = child_read_vars[i];
+      int j_max = -1;
+      for (size_t j = i + 1; j < num_children; ++j) {
+        bool conflict = false;
+        for (const auto *wb : child_write_bufs[j]) {
+          if (rb.count(wb)) {
+            conflict = true;
+            break;
+          }
+        }
+        if (!conflict) {
+          for (const auto *wv : child_write_vars[j]) {
+            if (rv.count(wv)) {
+              conflict = true;
+              break;
+            }
+          }
+        }
+        if (conflict)
+          j_max = static_cast<int>(j);
+      }
+      anchor_end[i] = j_max;
+    }
 
-    for (size_t si = 0; si < wg0_segments.size(); ++si) {
-      // Insert liveness boundary between segments.
-      segmented_stmts.push_back(AttrStmt(
-          Integer(0), attr::kAutoScheduleSharedMemoryBoundary, 0, Evaluate(0)));
+    std::vector<int> cluster_end(num_children, -1);
+    {
+      size_t i = 0;
+      while (i < num_children) {
+        if (anchor_end[i] < 0) {
+          ++i;
+          continue;
+        }
+        int e = anchor_end[i];
+        bool extended = true;
+        while (extended) {
+          extended = false;
+          for (int k = static_cast<int>(i) + 1; k <= e; ++k) {
+            if (anchor_end[k] > e) {
+              e = anchor_end[k];
+              extended = true;
+            }
+          }
+        }
+        cluster_end[i] = e;
+        i = static_cast<size_t>(e) + 1;
+      }
+    }
 
-      // Collect LetDecl info from current segment before converting to Stmt.
-      auto wg0_lets = CollectLetDeclInfo(wg0_segments[si]);
-      auto wg1_lets = CollectLetDeclInfo(wg1_segments[si]);
+    struct AccumulatedLet {
+      Var var;
+      PrimExpr value;
+      std::vector<Stmt> before;
+      std::vector<Stmt> after;
+    };
+    // per-wg accumulated LetDecl entries from earlier children
+    std::vector<std::vector<AccumulatedLet>> wg_accumulated_lets(num_wgs);
 
-      Stmt wg0_seg_stmt = SegmentToStmt(wg0_segments[si]);
-      Stmt wg1_seg_stmt = SegmentToStmt(wg1_segments[si]);
+    std::vector<Stmt> segmented_stmts;
+    bool first_non_let = true;
+    bool prev_was_loop = true;
 
-      // For segments after the first, wrap with renamed LetDecl bindings
-      // from all previous segments so that variables remain in scope.
-      if (si > 0) {
-        wg0_seg_stmt =
-            WrapWithRenamedLetDecls(wg0_seg_stmt, wg0_accumulated_lets);
-        wg1_seg_stmt =
-            WrapWithRenamedLetDecls(wg1_seg_stmt, wg1_accumulated_lets);
+    for (size_t ci = 0; ci < num_children; ++ci) {
+      auto unit = static_cast<ScheduleUnit *>(root_seq->children[ci].get());
+      bool is_let_decl = IsLetDeclNode(unit->child.get());
+
+      if (cluster_end[ci] >= 0) {
+        size_t end = static_cast<size_t>(cluster_end[ci]);
+
+        bool cluster_contains_loop = false;
+        for (size_t cj = ci; cj <= end; ++cj) {
+          auto u = static_cast<ScheduleUnit *>(root_seq->children[cj].get());
+          if (u && u->child && u->child->IsControl()) {
+            cluster_contains_loop = true;
+            break;
+          }
+        }
+
+        std::vector<std::vector<Stmt>> wg_stmt_seq(num_wgs);
+        for (size_t i = 0; i < num_wgs; ++i) {
+          for (size_t cj = ci; cj <= end; ++cj) {
+            if (!wg_children[i][cj])
+              continue;
+            auto tmp_seq = std::make_shared<SequenceNode>();
+            tmp_seq->children.push_back(wg_children[i][cj]);
+            Stmt s = ConvertIRStructureToStmt(tmp_seq.get(), outer_enable_epi);
+            if (!IsEvaluateZero(s)) {
+              wg_stmt_seq[i].push_back(s);
+            }
+          }
+        }
+
+        std::vector<Stmt> wg_stmts(num_wgs);
+        bool all_empty = true;
+        for (size_t i = 0; i < num_wgs; ++i) {
+          if (wg_stmt_seq[i].empty()) {
+            wg_stmts[i] = Evaluate(0);
+          } else {
+            wg_stmts[i] = SeqStmt::Flatten(wg_stmt_seq[i]);
+            all_empty = false;
+          }
+          for (int j = static_cast<int>(wg_accumulated_lets[i].size()) - 1;
+               j >= 0; --j) {
+            const AccumulatedLet &acc = wg_accumulated_lets[i][j];
+            Stmt body = wg_stmts[i];
+            if (!acc.after.empty()) {
+              std::vector<Stmt> tmp = acc.after;
+              if (!IsEvaluateZero(body)) {
+                tmp.push_back(body);
+              }
+              body = SeqStmt::Flatten(tmp);
+            }
+            Stmt let_stmt = LetStmt(acc.var, acc.value, body);
+            if (!acc.before.empty()) {
+              std::vector<Stmt> tmp = acc.before;
+              tmp.push_back(let_stmt);
+              wg_stmts[i] = SeqStmt::Flatten(tmp);
+            } else {
+              wg_stmts[i] = let_stmt;
+            }
+          }
+        }
+
+        if (!all_empty) {
+          if (prev_was_loop || cluster_contains_loop) {
+            segmented_stmts.push_back(
+                AttrStmt(Integer(0), attr::kAutoScheduleSharedMemoryBoundary, 0,
+                         Evaluate(0)));
+          }
+          if (first_non_let && !has_simt_copy && !has_inner_nreg_decision &&
+              num_wgs == 2 && config.enable_set_max_nreg) {
+            for (size_t i = 0; i < num_wgs; ++i) {
+              wg_stmts[i] =
+                  SeqStmt({Evaluate(Call(DataType::Handle(), tl::set_max_nreg(),
+                                         {i == 0 ? config.consumer_max_nreg
+                                                 : config.producer_max_nreg,
+                                          static_cast<int>(!i)})),
+                           wg_stmts[i]});
+            }
+          }
+          first_non_let = false;
+          segmented_stmts.push_back(MakeWarpgroupIf(wg_stmts));
+          prev_was_loop = cluster_contains_loop;
+        }
+
+        ci = end;
+        continue;
       }
 
-      // Accumulate this segment's LetDecls for future segments.
-      wg0_accumulated_lets.insert(wg0_accumulated_lets.end(), wg0_lets.begin(),
-                                  wg0_lets.end());
-      wg1_accumulated_lets.insert(wg1_accumulated_lets.end(), wg1_lets.begin(),
-                                  wg1_lets.end());
-
-      // Prepend set_max_nreg only to the first segment.
-      if (si == 0 && !has_simt_copy && config.enable_set_max_nreg) {
-        wg0_seg_stmt =
-            SeqStmt({Evaluate(Call(DataType::Handle(), tl::set_max_nreg(),
-                                   {config.consumer_max_nreg, 1})),
-                     wg0_seg_stmt});
-        wg1_seg_stmt =
-            SeqStmt({Evaluate(Call(DataType::Handle(), tl::set_max_nreg(),
-                                   {config.producer_max_nreg, 0})),
-                     wg1_seg_stmt});
+      if (is_let_decl) {
+        // Extract LetDecl {var, value, before, after} from each wg's filtered
+        // result.  The surrounding before/after live on the cloned
+        // ScheduleUnit wrapping the LetDecl task.
+        for (size_t i = 0; i < num_wgs; ++i) {
+          if (!wg_children[i][ci])
+            continue;
+          IRStructure *inner = wg_children[i][ci].get();
+          TaskNode *task = nullptr;
+          std::vector<Stmt> before_stmts;
+          std::vector<Stmt> after_stmts;
+          if (inner->IsScheduleUnit()) {
+            auto wg_unit = static_cast<ScheduleUnit *>(inner);
+            task = static_cast<TaskNode *>(wg_unit->child.get());
+            auto it_before = wg_unit->before.find(static_cast<int>(i));
+            if (it_before != wg_unit->before.end()) {
+              before_stmts = it_before->second;
+            }
+            auto it_after = wg_unit->after.find(static_cast<int>(i));
+            if (it_after != wg_unit->after.end()) {
+              after_stmts = it_after->second;
+            }
+          } else if (inner->IsTask()) {
+            task = static_cast<TaskNode *>(inner);
+          }
+          if (task && !task->stmts.empty()) {
+            const auto *let = task->stmts[0].as<LetStmtNode>();
+            if (let) {
+              wg_accumulated_lets[i].push_back({let->var, let->value,
+                                                std::move(before_stmts),
+                                                std::move(after_stmts)});
+            }
+          }
+        }
+        continue; // LetDecl children don't produce IfThenElse
       }
 
-      segmented_stmts.push_back(MakeWarpgroupIf(wg0_seg_stmt, wg1_seg_stmt));
+      // Build per-wg Stmt for this child, wrapped with accumulated LetDecls
+      std::vector<Stmt> wg_stmts(num_wgs);
+      bool all_empty = true;
+      for (size_t i = 0; i < num_wgs; ++i) {
+        if (wg_children[i][ci]) {
+          auto tmp_seq = std::make_shared<SequenceNode>();
+          tmp_seq->children.push_back(wg_children[i][ci]);
+          wg_stmts[i] =
+              ConvertIRStructureToStmt(tmp_seq.get(), outer_enable_epi);
+        } else {
+          wg_stmts[i] = Evaluate(0);
+        }
+        if (!IsEvaluateZero(wg_stmts[i])) {
+          all_empty = false;
+        }
+        // Wrap with accumulated LetDecl bindings (innermost first)
+        for (int j = static_cast<int>(wg_accumulated_lets[i].size()) - 1;
+             j >= 0; --j) {
+          const AccumulatedLet &acc = wg_accumulated_lets[i][j];
+          Stmt body = wg_stmts[i];
+          if (!acc.after.empty()) {
+            std::vector<Stmt> tmp = acc.after;
+            if (!IsEvaluateZero(body)) {
+              tmp.push_back(body);
+            }
+            body = SeqStmt::Flatten(tmp);
+          }
+          Stmt let_stmt = LetStmt(acc.var, acc.value, body);
+          if (!acc.before.empty()) {
+            std::vector<Stmt> tmp = acc.before;
+            tmp.push_back(let_stmt);
+            wg_stmts[i] = SeqStmt::Flatten(tmp);
+          } else {
+            wg_stmts[i] = let_stmt;
+          }
+        }
+      }
+
+      // Skip segments where all warpgroups produce empty statements
+      if (all_empty)
+        continue;
+
+      auto PeelLetsToInner = [](const Stmt &s) -> Stmt {
+        const Stmt *cur = &s;
+        while (const auto *let = cur->as<LetStmtNode>()) {
+          cur = &let->body;
+        }
+        return *cur;
+      };
+      bool is_shared_attr_segment = true;
+      Stmt shared_attr_stmt;
+      for (size_t i = 0; i < num_wgs; ++i) {
+        if (IsEvaluateZero(wg_stmts[i])) {
+          continue;
+        }
+        Stmt inner = PeelLetsToInner(wg_stmts[i]);
+        const auto *attr = inner.as<AttrStmtNode>();
+        if (!attr || !IsEvaluateZero(attr->body)) {
+          is_shared_attr_segment = false;
+          break;
+        }
+        if (!shared_attr_stmt.defined()) {
+          shared_attr_stmt = wg_stmts[i];
+        }
+      }
+
+      if (is_shared_attr_segment && shared_attr_stmt.defined()) {
+        segmented_stmts.push_back(shared_attr_stmt);
+        continue;
+      }
+
+      bool is_loop = unit->child->IsControl();
+
+      // Insert liveness boundary only before for-loop segments and
+      // before non-loop segments that follow a for-loop. Consecutive
+      // non-loop segments share a single boundary to avoid introducing
+      // spurious buffer reuse hints between them.
+      if (prev_was_loop || is_loop) {
+        segmented_stmts.push_back(
+            AttrStmt(Integer(0), attr::kAutoScheduleSharedMemoryBoundary, 0,
+                     Evaluate(0)));
+      }
+
+      // Prepend set_max_nreg only to the first non-LetDecl child
+      if (first_non_let && !has_simt_copy && !has_inner_nreg_decision &&
+          num_wgs == 2 && config.enable_set_max_nreg) {
+        for (size_t i = 0; i < num_wgs; ++i) {
+          wg_stmts[i] =
+              SeqStmt({Evaluate(Call(DataType::Handle(), tl::set_max_nreg(),
+                                     {i == 0 ? config.consumer_max_nreg
+                                             : config.producer_max_nreg,
+                                      static_cast<int>(!i)})),
+                       wg_stmts[i]});
+        }
+      }
+      first_non_let = false;
+
+      segmented_stmts.push_back(MakeWarpgroupIf(wg_stmts));
+
+      prev_was_loop = is_loop;
     }
     segmented_stmts.push_back(AttrStmt(
         Integer(0), attr::kAutoScheduleSharedMemoryBoundary, 0, Evaluate(0)));
     if_then_else = SeqStmt::Flatten(segmented_stmts);
-  } else if (wg0_has_stmts) {
-    // Only warpgroup 0 has statements, execute unconditionally
-    if_then_else =
-        ConvertIRStructureToStmt(wg0_structure.get(), outer_enable_epi);
-  } else if (wg1_has_stmts) {
-    // Only warpgroup 1 has statements, execute unconditionally
-    if_then_else =
-        ConvertIRStructureToStmt(wg1_structure.get(), outer_enable_epi);
   } else {
-    // Neither warpgroup 0 nor 1 has statements
-    if_then_else = Evaluate(0);
+    // Fallback for non-SequenceNode root: no boundary insertion, simple
+    // partition
+    std::vector<Stmt> wg_stmts(num_wgs);
+    for (size_t i = 0; i < num_wgs; ++i) {
+      if (wg_structures[i]) {
+        wg_stmts[i] =
+            ConvertIRStructureToStmt(wg_structures[i].get(), outer_enable_epi);
+      } else {
+        wg_stmts[i] = Evaluate(0);
+      }
+    }
+    if (!has_simt_copy && !has_inner_nreg_decision && num_wgs == 2 &&
+        config.enable_set_max_nreg) {
+      for (size_t i = 0; i < num_wgs; ++i) {
+        wg_stmts[i] =
+            SeqStmt({Evaluate(Call(DataType::Handle(), tl::set_max_nreg(),
+                                   {i == 0 ? config.consumer_max_nreg
+                                           : config.producer_max_nreg,
+                                    static_cast<int>(!i)})),
+                     wg_stmts[i]});
+      }
+    }
+    if_then_else = MakeWarpgroupIf(wg_stmts);
   }
 
-  PrimExpr barrier_count = config.enable_thread_extend
-                               ? thread_count[0] + thread_count[1]
-                               : thread_var->dom->extent;
+  PrimExpr updated_thread_extent = std::accumulate(
+      thread_count.begin() + 1, thread_count.end(), thread_count[0]);
 
   Stmt pro_and_warpgroup_stmt;
-  if (wg_pro_neutral_has_stmts) {
-    if (!IsEvaluateZero(if_then_else) && !IsEvaluateZero(pro_neutral_body)) {
-      // Both have statements: insert barriers for neutral-to-warpgroup
-      // synchronization
-      pro_and_warpgroup_stmt = InsertBarriersForNeutralSync(
-          pro_neutral_body, if_then_else, barrier_buffers, barrier_map,
-          barrier_count, neutral_sync_shared_barrier);
-    } else if (!IsEvaluateZero(if_then_else) ||
-               !IsEvaluateZero(pro_neutral_body)) {
-      // Only one has actual statements
-      std::vector<Stmt> stmts;
-      if (!IsEvaluateZero(pro_neutral_body)) {
-        stmts.push_back(pro_neutral_body);
-      }
-      if (!IsEvaluateZero(if_then_else)) {
-        stmts.push_back(if_then_else);
-      }
-      if (stmts.size() == 1) {
-        pro_and_warpgroup_stmt = stmts[0];
-      } else {
-        pro_and_warpgroup_stmt = SeqStmt(stmts);
-      }
-    } else {
-      // Both are empty
-      pro_and_warpgroup_stmt = Evaluate(0);
-    }
+  if (wg_pro_neutral_has_stmts && !IsEvaluateZero(pro_neutral_body)) {
+    pro_and_warpgroup_stmt = InsertBarriersForNeutralSync(
+        pro_neutral_body, if_then_else, barrier_buffers, barrier_map,
+        updated_thread_extent, neutral_sync_shared_barrier);
   } else {
     pro_and_warpgroup_stmt = if_then_else;
   }
@@ -1295,15 +1505,14 @@ Stmt ApplyWarpgroupPartitionToIRStructure(
   bool need_shared_barrier_for_epi = false;
   bool need_tmem_barrier_for_epi = false;
   if (wg_epi_neutral_structure) {
-    for (const auto *warpgroup_structure :
-         {wg0_structure.get(), wg1_structure.get()}) {
+    for (const auto &warpgroup_structure : wg_structures) {
       need_shared_barrier_for_epi =
           need_shared_barrier_for_epi ||
-          HasSharedWriteReadDependency(warpgroup_structure,
+          HasSharedWriteReadDependency(warpgroup_structure.get(),
                                        wg_epi_neutral_structure.get());
       need_tmem_barrier_for_epi =
           need_tmem_barrier_for_epi ||
-          HasTmemWriteReadDependency(warpgroup_structure,
+          HasTmemWriteReadDependency(warpgroup_structure.get(),
                                      wg_epi_neutral_structure.get());
     }
   }
@@ -1313,10 +1522,12 @@ Stmt ApplyWarpgroupPartitionToIRStructure(
       !IsEvaluateZero(epi_neutral_body)) {
     // Both have statements: insert barriers for warpgroup-to-epi_neutral
     // synchronization
+    // TODO: tensor core may not only in wg0?
     combined_stmt = InsertBarriersForNeutralSyncWithDependency(
         pro_and_warpgroup_stmt, epi_neutral_body, barrier_buffers, barrier_map,
-        barrier_count, need_shared_barrier_for_epi, need_tmem_barrier_for_epi,
-        Buffer(), thread_var->var, 0, thread_count[0]);
+        updated_thread_extent, need_shared_barrier_for_epi,
+        need_tmem_barrier_for_epi, Buffer(), thread_var->var, 0,
+        thread_count[0]);
   } else if (!IsEvaluateZero(epi_neutral_body)) {
     combined_stmt = epi_neutral_body;
   } else {

@@ -3,7 +3,7 @@ from tvm import tir, IRModule
 from tvm.target import Target
 import tilelang
 from tilelang.transform import PassContext
-from tilelang.contrib.nvcc import have_tma, is_hopper, have_pdl
+from tilelang.contrib.nvcc import have_tma, have_pdl
 
 
 def allow_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
@@ -28,8 +28,164 @@ def module_has_tma(mod: IRModule) -> bool:
     return any(func.attrs and func.attrs.get("tl.has_tma", False) for _, func in mod.functions.items())
 
 
-def allow_fence_proxy(target: Target | None = None) -> bool:
-    return have_tma(target)
+def module_has_barrier(mod: IRModule) -> bool:
+    """Check whether any PrimFunc in ``mod`` allocates / initializes an mbarrier."""
+    from tvm.tir import stmt_functor
+
+    for _, func in mod.functions.items():
+        if not isinstance(func, tir.PrimFunc):
+            continue
+
+        # Explicit allocations with a barrier storage scope.
+        for buf in func.buffer_map.values():
+            scope = buf.scope() if hasattr(buf, "scope") else ""
+            if isinstance(scope, str) and scope.startswith("shared.barrier"):
+                return True
+            if isinstance(scope, str) and scope.startswith("shared.cluster_barrier"):
+                return True
+
+        found = [False]
+
+        def _check(node, _found=found):
+            if _found[0]:
+                return
+            # Buffer / BufferRealize allocations inside the body.
+            buffer = None
+            if isinstance(node, tir.BufferRealize):
+                buffer = node.buffer
+            elif isinstance(node, tir.Allocate):
+                # Allocate does not carry storage scope directly; rely on the
+                # associated AttrStmt "storage_scope" picked up below.
+                buffer = None
+            if buffer is not None:
+                scope = buffer.scope() if hasattr(buffer, "scope") else ""
+                if isinstance(scope, str) and (scope.startswith("shared.barrier") or scope.startswith("shared.cluster_barrier")):
+                    _found[0] = True
+                    return
+            # Block-level "barrier_init" annotation produced by alloc_barrier.
+            if isinstance(node, tir.Block):
+                annotations = getattr(node, "annotations", None)
+                if annotations is not None and "barrier_init" in annotations:
+                    _found[0] = True
+                    return
+            # AttrStmt-level "storage_scope" carrying a barrier scope.
+            if isinstance(node, tir.AttrStmt) and node.attr_key == "storage_scope":
+                value = node.value
+                scope_str = value.value if hasattr(value, "value") else str(value)
+                if isinstance(scope_str, str) and (
+                    scope_str.startswith("shared.barrier") or scope_str.startswith("shared.cluster_barrier")
+                ):
+                    _found[0] = True
+
+        stmt_functor.post_order_visit(func.body, _check)
+        if found[0]:
+            return True
+
+    return False
+
+
+def module_uses_thread_var(mod: IRModule) -> bool:
+    """Check whether any PrimFunc in ``mod`` references thread-index variables
+    inside its body.
+    """
+    from tvm.tir import stmt_functor
+
+    for _, func in mod.functions.items():
+        if not isinstance(func, tir.PrimFunc):
+            continue
+
+        thread_extent_vars: set = set()
+        explicit_thread_binding_loop: list[bool] = [False]
+
+        def _collect(
+            node,
+            _thread_extent_vars=thread_extent_vars,
+            _explicit_thread_binding_loop=explicit_thread_binding_loop,
+        ):
+            if isinstance(node, tir.AttrStmt) and node.attr_key == "thread_extent":
+                iter_var = node.node
+                if isinstance(iter_var, tir.IterVar):
+                    tag = getattr(iter_var, "thread_tag", "") or ""
+                    if tag.startswith("threadIdx."):
+                        _thread_extent_vars.add(iter_var.var)
+            elif isinstance(node, tir.For) and node.kind == tir.ForKind.THREAD_BINDING:
+                tb = node.thread_binding
+                tag = getattr(tb, "thread_tag", "") if tb is not None else ""
+                if isinstance(tag, str) and tag.startswith("threadIdx."):
+                    _explicit_thread_binding_loop[0] = True
+
+        stmt_functor.post_order_visit(func.body, _collect)
+
+        if explicit_thread_binding_loop[0]:
+            return True
+
+        if not thread_extent_vars:
+            continue
+
+        uses_thread_var = [False]
+
+        def _find_use(
+            node,
+            _uses_thread_var=uses_thread_var,
+            _thread_extent_vars=thread_extent_vars,
+        ):
+            if _uses_thread_var[0]:
+                return
+            if isinstance(node, tir.Var) and node in _thread_extent_vars:
+                _uses_thread_var[0] = True
+
+        def _walk(
+            stmt,
+            _uses_thread_var=uses_thread_var,
+            _find_use=_find_use,
+        ):
+            if _uses_thread_var[0]:
+                return
+            if isinstance(stmt, tir.AttrStmt) and stmt.attr_key == "thread_extent":
+                _walk(stmt.body)
+                return
+            stmt_functor.post_order_visit(stmt, _find_use)
+
+        _walk(func.body)
+
+        if uses_thread_var[0]:
+            return True
+
+    return False
+
+
+def module_has_runtime_pointer_tensor(mod: IRModule) -> bool:
+    """Detect ``T.make_tensor(<runtime ptr>, ...)`` style base addresses."""
+    from tvm.ir import PointerType
+    from tvm.tir import stmt_functor
+
+    for _, func in mod.functions.items():
+        if not isinstance(func, tir.PrimFunc):
+            continue
+
+        found = [False]
+
+        def _check(node, _found=found):
+            if _found[0]:
+                return
+            if not isinstance(node, tir.LetStmt):
+                return
+            var = node.var
+            ann = getattr(var, "type_annotation", None)
+            if not isinstance(ann, PointerType):
+                return
+            scope = getattr(ann, "storage_scope", "") or ""
+            if scope != "global":
+                return
+            value = node.value
+            if isinstance(value, tir.Call) and getattr(value.op, "name", "") == "tir.reinterpret":
+                _found[0] = True
+
+        stmt_functor.post_order_visit(func.body, _check)
+        if found[0]:
+            return True
+
+    return False
 
 
 def allow_vectorize(pass_ctx: PassContext | None = None) -> bool:
@@ -39,10 +195,18 @@ def allow_vectorize(pass_ctx: PassContext | None = None) -> bool:
     return not disable_vectorize
 
 
-def allow_autoschedule(pass_ctx: PassContext | None = None) -> bool:
+def allow_autoschedule(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()
     enable_autoschedule = pass_ctx.config.get("tl.enable_auto_schedule", False)
+    if enable_autoschedule and target is not None and target.kind.name != "cuda":
+        # Auto-schedule only works on CUDA targets; skip on CPU
+        return False
+    # When TMA lowering is disabled, skip auto-schedule to avoid
+    # rewriting copies to tma_copy that cannot be lowered.
+    disable_tma_lower = pass_ctx.config.get("tl.disable_tma_lower", False)
+    if disable_tma_lower:
+        return False
     return enable_autoschedule
 
 
@@ -91,6 +255,13 @@ def should_enable_race_check(pass_ctx: PassContext | None = None) -> bool:
     return enabled
 
 
+def should_enable_prelower_semantic_check(pass_ctx: PassContext | None = None) -> bool:
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    enabled = not pass_ctx.config.get(tilelang.PassConfigKey.TL_DISABLE_PRELOWER_SEMANTIC_CHECK, False)
+    return enabled
+
+
 def get_layout_visual_formats(pass_ctx: PassContext | None = None) -> list[str]:
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()
@@ -132,6 +303,9 @@ def PreLowerSemanticCheck(mod: IRModule) -> None:
     in Python side instead of letting the error dive into the complicated TVM/C++ stack.
     Note: This is a validation-only pipeline of passes and does not modify or return the module.
     """
+
+    if not should_enable_prelower_semantic_check():
+        return
 
     # Print AST for debugging purpose
     if should_enable_ast_print():
@@ -180,16 +354,42 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.InjectAssumes()(mod)
     # Simplify the IR expressions
     mod = tilelang.transform.Simplify()(mod)
-    if allow_autoschedule():
-        # Auto schedule for high-level operations
+    if (
+        allow_autoschedule(target=target)
+        and not module_uses_thread_var(mod)
+        and not module_has_barrier(mod)
+        and not module_has_runtime_pointer_tensor(mod)
+    ):
+        # Auto schedule for high-level operations.
+        # Skip when the kernel already manages explicit mbarriers
+        # (alloc_barrier / alloc_cluster_barrier), because reordering the
+        # rewrites breaks invariants that later barrier lowering and the
+        # WS / pipelined TMA copy pipeline rely on.
+        # Also skip when the kernel uses ``T.make_tensor`` runtime-bound
+        # base addresses (ptr-backed grouped GEMM): promoting their copies
+        # to TMA would lift descriptor creation past the LetStmt that
+        # defines the base ``Var``, breaking ``MakePackedAPI``.
         mod = tilelang.transform.IfConditionExtract()(mod)
         mod = tilelang.transform.AutoSchedule(False)(mod)
         mod = tilelang.transform.Simplify()(mod)
     # Set layouts for reducers
     mod = tilelang.transform.LayoutReducer()(mod)
+    # Tile-level warp specialization: runs before layout inference so that
+    # producer/consumer split happens at the high-level tile-op IR.
+    # The pass classifies copy ops as TMA/cp.async/sync inline (no prior
+    # InstructionAnnotation pass needed). Shared buffers are multi-versioned
+    # internally only for functions where the WS transformation actually
+    # applies.
+    if allow_warp_specialized(target=target):
+        mod = tilelang.transform.ProducerConsumerWarpSpecialized()(mod)
     # Lower 2SM TCGEN5MMA and related on Blackwell target (must run before
     # LayoutInference so that the use_2cta annotation is visible to infer_layout)
     mod = tilelang.transform.LowerBlackwell2SM()(mod)
+    # Run pipeline planning and software-pipeline rewriting before layout
+    # inference so inferred layouts see the final pipelined structure directly.
+    mod = tilelang.transform.PipelinePlanning()(mod)
+    mod = tilelang.transform.InjectSoftwarePipeline()(mod)
+    mod = tilelang.transform.Simplify()(mod)
     # Infer memory layouts for fragments and shared memory
     mod = tilelang.transform.LayoutInference()(mod)
     # Visualize the layout
@@ -224,33 +424,15 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # which may be introduced by the LegalizeSafeMemoryAccess
     mod = tilelang.transform.IfStmtBinding()(mod)
     has_tma = module_has_tma(mod)
-    use_ws = has_tma and allow_warp_specialized(pass_ctx=pass_ctx, target=target)
-    if has_tma:
-        # In WS mode, version all buffers (barriers + data) because
-        # ProducerConsumerWarpSpecialized handles pipeline overlap and
-        # InjectSoftwarePipeline won't re-version data buffers.
-        # Without WS, only version barrier buffers for mbarrier parity
-        # rewriting; data buffer versioning is left to InjectSoftwarePipeline.
-        mod = tilelang.transform.MultiVersionBuffer(barrier_only=not use_ws)(mod)
-        if use_ws:
-            mod = tilelang.transform.ProducerConsumerWarpSpecialized()(mod)
-    else:
-        # Non-TMA: MultiVersionBuffer is not used, so buffer allocation
-        # locations must be planned explicitly.  In TMA paths this is
-        # handled implicitly by MultiVersionBuffer (which runs LCA
-        # analysis to place versioned buffers).
-        mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
+    # Pipeline barriers are now created at final expanded size by
+    # InjectSoftwarePipeline, so no late MVB barrier fixup is needed.
+    # Buffer allocation placement is handled uniformly for both paths.
+    mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
     mod = tilelang.transform.LowerSharedBarrier()(mod)
-    mod = tilelang.transform.PipelinePlanning()(mod)
-    mod = tilelang.transform.InjectSoftwarePipeline()(mod)
     if has_tma:
         mod = tilelang.transform.FuseMBarrierArriveExpectTx()(mod)
     mod = tilelang.transform.HoistGlobalBufferAllocations()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
-    if is_hopper(target):
-        mod = tilelang.transform.RewriteWgmmaSync()(mod)
-    mod = tilelang.transform.Simplify()(mod)
-    mod = tilelang.transform.OptimizeCPAsyncSync()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tir.transform.NarrowDataType(32)(mod)
     mod = tilelang.transform.FlattenBuffer()(mod)
@@ -297,15 +479,16 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # because the merged allocation site is at the beginning of each device function
     enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
     mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
-    if allow_warp_specialized(pass_ctx=pass_ctx, target=target):
-        mod = tilelang.transform.InjectFenceProxy()(mod)
-    else:
-        if allow_fence_proxy(target=target):
-            # in hopper device, wgmma is an async proxy
-            # so we need to inject a fence proxy before it
-            mod = tilelang.transform.InjectFenceProxy()(mod)
+    # InjectFenceProxy is a no-op on targets that lack the TMA / async-proxy
+    # programming model; the pass itself checks the PrimFunc's target.
+    mod = tilelang.transform.InjectFenceProxy()(mod)
     mod = tilelang.transform.ThreadSync("shared")(mod)
     mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
+    # Inject conservative tcgen05 fences on Blackwell (SM100+).
+    # Must run after ThreadSync so that tvm_storage_sync calls are present.
+    # The pass handles shared syncs and simple linear wait/use, use/arrive
+    # handoffs, and is a no-op on non-SM100 targets or functions without TMEM.
+    mod = tilelang.transform.InjectTcgen05Fence()(mod)
     mod = tilelang.transform.MergeIfStmt()(mod)
     # NOTE: LowerPTXAsyncCopy is applied earlier (before PipelinePlanning).
     if allow_warp_specialized(pass_ctx=pass_ctx, target=target):

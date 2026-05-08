@@ -29,15 +29,56 @@ class TaskNode;
 class ControlNode;
 class SequenceNode;
 class WrapperNode;
+class IfNode;
 
-// Structure to store region access information with warpgroup id
-struct RegionAccessInfo {
-  BufferRegion region;
-  bool is_write;    // true for write, false for read
-  int warpgroup_id; // warpgroup id of the innermost TaskNode
+// Scheduling phase: separates "when does this task run" from "which warpgroup"
+enum class SchedulePhase : uint8_t {
+  kBody = 0,     // Normal body task - participates in warpgroup partition
+  kPrologue = 1, // Runs on ALL threads BEFORE warpgroup-specific code
+  kEpilogue = 2, // Runs on ALL threads AFTER warpgroup-specific code
+};
 
-  RegionAccessInfo(BufferRegion region, bool is_write, int warpgroup_id)
-      : region(region), is_write(is_write), warpgroup_id(warpgroup_id) {}
+// Special warpgroup id constants
+constexpr int kWarpgroupUnassigned = -1; // Not yet assigned (initial state)
+constexpr int kWarpgroupBroadcast = -2;  // Broadcast: the statement is cloned
+                                         // into every warp group; each wg
+                                         // operates on its own register copies.
+                                         // No cross-wg sync is needed for
+                                         // register (local.fragment) buffers.
+
+// Helper: check if a warpgroup id represents a broadcast task
+inline bool IsWarpgroupBroadcast(int wg_id) {
+  return wg_id == kWarpgroupBroadcast;
+}
+
+// Structure to store buffer access information
+struct BufferAccessInfo {
+  Buffer buffer;
+  bool is_write;        // true for write, false for read
+  int warpgroup_id;     // warpgroup id of the access
+  const TaskNode *task; // the innermost TaskNode
+
+  BufferAccessInfo(Buffer buffer, bool is_write, int warpgroup_id,
+                   const TaskNode *task)
+      : buffer(buffer), is_write(is_write), warpgroup_id(warpgroup_id),
+        task(task) {}
+
+  // Define operator< for set
+  bool operator<(const BufferAccessInfo &other) const {
+    if (buffer != other.buffer) {
+      return buffer.get() < other.buffer.get();
+    }
+    if (is_write != other.is_write) {
+      return is_write < other.is_write;
+    }
+    if (warpgroup_id != other.warpgroup_id) {
+      return warpgroup_id < other.warpgroup_id;
+    }
+    if (task != other.task) {
+      return task < other.task;
+    }
+    return false;
+  }
 };
 
 // Helper function to compare if two regions are equal
@@ -62,7 +103,7 @@ inline bool RegionsEqual(const Region &a, const Region &b) {
 // Base class for all IR nodes in scheduling
 class IRStructure {
 public:
-  enum class Kind { kTask, kControl, kSequence, kWrapper, kSchedule };
+  enum class Kind { kTask, kControl, kSequence, kWrapper, kSchedule, kIf };
 
   virtual ~IRStructure() = default;
   virtual Kind GetKind() const = 0;
@@ -74,11 +115,15 @@ public:
   bool IsSequence() const { return GetKind() == Kind::kSequence; }
   bool IsWrapper() const { return GetKind() == Kind::kWrapper; }
   bool IsScheduleUnit() const { return GetKind() == Kind::kSchedule; }
+  bool IsIf() const { return GetKind() == Kind::kIf; }
 
   // Resource usage flags (accessible by all IR nodes)
   virtual bool UsesCUDACore() const = 0;
   virtual bool UsesTMACore() const = 0;
   virtual bool UsesTensorCore() const = 0;
+
+  virtual bool HasWGMMA() const = 0;
+  virtual bool HasTCGEN05() const = 0;
 
   // Memory access regions (collected during analysis)
   virtual std::vector<BufferRegion> GetReadRegions() const = 0;
@@ -101,25 +146,70 @@ public:
   virtual void SetLatency(int64_t latency) = 0;
   virtual void SetII(int64_t ii) = 0;
 
-  // Recursive region collection method
-  virtual void CollectRegions(
-      std::vector<RegionAccessInfo> &result,
-      std::set<std::pair<Buffer, std::pair<int, int>>> &visited) const = 0;
+  // Recursive buffer collection method
+  virtual void
+  CollectBufferAccessInfo(int num_wgs, SchedulePhase phase,
+                          std::set<BufferAccessInfo> &result) const = 0;
 
-  std::vector<RegionAccessInfo> GetReadWriteRegions() const {
-    std::vector<RegionAccessInfo> result;
-    std::set<std::pair<Buffer, std::pair<int, int>>> visited;
-    CollectRegions(result, visited);
+  std::vector<BufferAccessInfo>
+  GetBufferAccessInfo(int num_wgs = 1,
+                      SchedulePhase phase = SchedulePhase::kBody) const {
+    std::set<BufferAccessInfo> result;
+    CollectBufferAccessInfo(num_wgs, phase, result);
+    return std::vector<BufferAccessInfo>(result.begin(), result.end());
+  }
+
+  // Collect tasks that could possibly be the first/last to access a specific
+  // (buffer, is_write, wg_id) within this IR subtree.
+  // The result set is populated with candidate tasks.
+  // Returns true if this subtree is guaranteed to contain at least one matching
+  // access (i.e., the access must happen unconditionally).
+  virtual bool
+  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                          SchedulePhase phase,
+                          std::set<const TaskNode *> &result) const = 0;
+
+  virtual bool
+  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                         SchedulePhase phase,
+                         std::set<const TaskNode *> &result) const = 0;
+
+  // Convenience wrappers that return the result set directly.
+  std::set<const TaskNode *>
+  GetFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                      SchedulePhase phase = SchedulePhase::kBody) const {
+    std::set<const TaskNode *> result;
+    CollectFirstAccessTasks(buffer, is_write, wg_id, phase, result);
+    return result;
+  }
+
+  std::set<const TaskNode *>
+  GetLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                     SchedulePhase phase = SchedulePhase::kBody) const {
+    std::set<const TaskNode *> result;
+    CollectLastAccessTasks(buffer, is_write, wg_id, phase, result);
     return result;
   }
 
   // Substitute a variable throughout this IR node
   virtual void SubstituteVar(const Var &old_var, const Var &new_var) = 0;
 
-  // Get warpgroup id for this node (-1 if not applicable)
-  virtual int GetWarpgroupId() const { return -1; }
+  // Get warpgroup id for this node (kWarpgroupUnassigned if not applicable)
+  virtual int GetWarpgroupId() const { return kWarpgroupUnassigned; }
+
+  // Get scheduling phase for this node
+  virtual SchedulePhase GetSchedulePhase() const {
+    return SchedulePhase::kBody;
+  }
+  // Convenience: true if this node is prologue or epilogue (not body)
+  virtual bool IsNeutralPhase() const {
+    return GetSchedulePhase() != SchedulePhase::kBody;
+  }
 
   virtual bool containWarpgroupId(int id) const = 0;
+
+  // Check if this node (or any descendant) contains a loop_break call
+  virtual bool ContainsLoopBreak() const = 0;
 
   // Start time for scheduling
   void SetStartTime(int64_t start_time) { start_time_ = start_time; }
@@ -186,6 +276,13 @@ public:
   void SetWarpgroupId(int warpgroup_id) { warpgroup_id_ = warpgroup_id; }
   int GetWarpgroupId() const override { return warpgroup_id_; }
 
+  // Scheduling phase (prologue / body / epilogue)
+  void SetSchedulePhase(SchedulePhase phase) { schedule_phase_ = phase; }
+  SchedulePhase GetSchedulePhase() const override { return schedule_phase_; }
+  bool IsNeutralPhase() const override {
+    return schedule_phase_ != SchedulePhase::kBody;
+  }
+
   // TMA load flag
   void SetHasTMALoad(bool value) { has_tma_load_ = value; }
   bool HasTMALoad() const { return has_tma_load_; }
@@ -246,6 +343,9 @@ public:
     return has_gemm_inst_ && gemm_inst_ == GemmInst::kTCGEN5MMA;
   }
 
+  bool HasWGMMA() const override { return is_WGMMA(); }
+  bool HasTCGEN05() const override { return is_TCGEN05(); }
+
   // Get aggregated shape information for II estimation
   int64_t GetTotalTensorCoreOps() const {
     int64_t total_ops = 0;
@@ -296,16 +396,26 @@ public:
   void AddReadVar(const Var &var) { read_vars_.push_back(var); }
   void AddWriteVar(const Var &var) { write_vars_.push_back(var); }
 
-  void CollectRegions(
-      std::vector<RegionAccessInfo> &result,
-      std::set<std::pair<Buffer, std::pair<int, int>>> &visited) const override;
+  void
+  CollectBufferAccessInfo(int num_wgs, SchedulePhase phase,
+                          std::set<BufferAccessInfo> &result) const override;
+
+  bool
+  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                          SchedulePhase phase,
+                          std::set<const TaskNode *> &result) const override;
+  bool
+  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                         SchedulePhase phase,
+                         std::set<const TaskNode *> &result) const override;
 
   bool containWarpgroupId(int id) const override {
-    return ContainsLoopBreak() || warpgroup_id_ == id;
+    return ContainsLoopBreak() || IsWarpgroupBroadcast(warpgroup_id_) ||
+           warpgroup_id_ == id;
   }
 
   // Check if this task contains loop_break call
-  bool ContainsLoopBreak() const;
+  bool ContainsLoopBreak() const override;
 
 private:
   // Resource usage flags
@@ -324,7 +434,9 @@ private:
   int64_t latency_{0}; // Estimated latency in cycles
   int64_t ii_{0};      // Initiation interval in cycles
   int warpgroup_id_{
-      -1}; // Warpgroup id for warpgroup specialization (-1 means unassigned)
+      kWarpgroupUnassigned}; // Warpgroup id for warpgroup specialization
+  SchedulePhase schedule_phase_{
+      SchedulePhase::kBody}; // Scheduling phase (prologue/body/epilogue)
 
   // TMA information
   bool has_tma_load_{false};
@@ -360,6 +472,11 @@ public:
   }
   bool UsesTensorCore() const override {
     return child ? child->UsesTensorCore() : false;
+  }
+
+  bool HasWGMMA() const override { return child ? child->HasWGMMA() : false; }
+  bool HasTCGEN05() const override {
+    return child ? child->HasTCGEN05() : false;
   }
 
   // Memory access regions (aggregate from child & task)
@@ -445,9 +562,18 @@ public:
   void SetLatency(int64_t latency) override { latency_ = latency; }
   void SetII(int64_t ii) override { ii_ = ii; }
 
-  void CollectRegions(
-      std::vector<RegionAccessInfo> &result,
-      std::set<std::pair<Buffer, std::pair<int, int>>> &visited) const override;
+  void
+  CollectBufferAccessInfo(int num_wgs, SchedulePhase phase,
+                          std::set<BufferAccessInfo> &result) const override;
+
+  bool
+  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                          SchedulePhase phase,
+                          std::set<const TaskNode *> &result) const override;
+  bool
+  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                         SchedulePhase phase,
+                         std::set<const TaskNode *> &result) const override;
 
   bool hasPromote() const { return has_promote_; }
 
@@ -461,7 +587,11 @@ public:
   std::shared_ptr<IRStructure> Clone() const override;
 
   bool containWarpgroupId(int id) const override {
-    return child->containWarpgroupId(id);
+    return child && child->containWarpgroupId(id);
+  }
+
+  bool ContainsLoopBreak() const override {
+    return false; // Loop does not contain loop break
   }
 
 private:
@@ -470,6 +600,9 @@ private:
   int64_t ii_{0};      // Initiation interval in cycles
   bool has_promote_{false};
   int64_t ii_per_iter_{0};
+
+public:
+  std::set<Buffer> multi_buffering_buffers;
 };
 
 // Wrapper node: contains a Wrapper statement with variable, value, and child
@@ -493,20 +626,47 @@ public:
     return child ? child->UsesTensorCore() : false;
   }
 
-  // Memory access regions (aggregate from child)
-  std::vector<BufferRegion> GetReadRegions() const override {
-    return child ? child->GetReadRegions() : std::vector<BufferRegion>{};
-  }
-  std::vector<BufferRegion> GetWriteRegions() const override {
-    return child ? child->GetWriteRegions() : std::vector<BufferRegion>{};
+  bool HasWGMMA() const override { return child ? child->HasWGMMA() : false; }
+  bool HasTCGEN05() const override {
+    return child ? child->HasTCGEN05() : false;
   }
 
-  // Variable access (aggregate from child)
+  // Memory access regions (aggregate from child & task)
+  std::vector<BufferRegion> GetReadRegions() const override {
+    std::vector<BufferRegion> regions =
+        child ? child->GetReadRegions() : std::vector<BufferRegion>{};
+    if (task) {
+      auto task_regions = task->GetReadRegions();
+      regions.insert(regions.end(), task_regions.begin(), task_regions.end());
+    }
+    return regions;
+  }
+  std::vector<BufferRegion> GetWriteRegions() const override {
+    std::vector<BufferRegion> regions =
+        child ? child->GetWriteRegions() : std::vector<BufferRegion>{};
+    if (task) {
+      auto task_regions = task->GetWriteRegions();
+      regions.insert(regions.end(), task_regions.begin(), task_regions.end());
+    }
+    return regions;
+  }
+
+  // Variable access (aggregate from child & task)
   std::vector<Var> GetReadVars() const override {
-    return child ? child->GetReadVars() : std::vector<Var>{};
+    std::vector<Var> vars = child ? child->GetReadVars() : std::vector<Var>{};
+    if (task) {
+      auto task_vars = task->GetReadVars();
+      vars.insert(vars.end(), task_vars.begin(), task_vars.end());
+    }
+    return vars;
   }
   std::vector<Var> GetWriteVars() const override {
-    return child ? child->GetWriteVars() : std::vector<Var>{};
+    std::vector<Var> vars = child ? child->GetWriteVars() : std::vector<Var>{};
+    if (task) {
+      auto task_vars = task->GetWriteVars();
+      vars.insert(vars.end(), task_vars.begin(), task_vars.end());
+    }
+    return vars;
   }
 
   void SubstituteVar(const Var &old_var, const Var &new_var) override {
@@ -549,15 +709,29 @@ public:
   void SetLatency(int64_t latency) override { latency_ = latency; }
   void SetII(int64_t ii) override { ii_ = ii; }
 
-  void CollectRegions(
-      std::vector<RegionAccessInfo> &result,
-      std::set<std::pair<Buffer, std::pair<int, int>>> &visited) const override;
+  void
+  CollectBufferAccessInfo(int num_wgs, SchedulePhase phase,
+                          std::set<BufferAccessInfo> &result) const override;
+
+  bool
+  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                          SchedulePhase phase,
+                          std::set<const TaskNode *> &result) const override;
+  bool
+  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                         SchedulePhase phase,
+                         std::set<const TaskNode *> &result) const override;
 
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;
 
   bool containWarpgroupId(int id) const override {
-    return child->containWarpgroupId(id);
+    return child && child->containWarpgroupId(id);
+  }
+
+  bool ContainsLoopBreak() const override {
+    return (task && task->ContainsLoopBreak()) ||
+           (child && child->ContainsLoopBreak());
   }
 
 private:
@@ -566,18 +740,197 @@ private:
   int64_t ii_{0};      // Initiation interval in cycles
 };
 
+// If node: represents an IfThenElse conditional with independently schedulable
+// branches. Acts as an atomic unit for outer scheduling but allows recursive
+// scheduling within each branch.
+class IfNode : public IRStructure {
+public:
+  PrimExpr condition;
+  std::shared_ptr<IRStructure> then_child;
+  std::shared_ptr<IRStructure> else_child; // optional
+  std::shared_ptr<TaskNode> task; // resource analysis for the condition expr
+
+  Kind GetKind() const override { return Kind::kIf; }
+
+  // Resource usage flags (aggregate from both branches)
+  bool UsesCUDACore() const override {
+    bool result = false;
+    if (then_child)
+      result |= then_child->UsesCUDACore();
+    if (else_child)
+      result |= else_child->UsesCUDACore();
+    return result;
+  }
+  bool UsesTMACore() const override {
+    bool result = false;
+    if (then_child)
+      result |= then_child->UsesTMACore();
+    if (else_child)
+      result |= else_child->UsesTMACore();
+    return result;
+  }
+  bool UsesTensorCore() const override {
+    bool result = false;
+    if (then_child)
+      result |= then_child->UsesTensorCore();
+    if (else_child)
+      result |= else_child->UsesTensorCore();
+    return result;
+  }
+
+  bool HasWGMMA() const override {
+    return (then_child && then_child->HasWGMMA()) ||
+           (else_child && else_child->HasWGMMA());
+  }
+  bool HasTCGEN05() const override {
+    return (then_child && then_child->HasTCGEN05()) ||
+           (else_child && else_child->HasTCGEN05());
+  }
+
+  // Memory access regions (union of both branches + task)
+  std::vector<BufferRegion> GetReadRegions() const override {
+    std::vector<BufferRegion> regions;
+    if (task) {
+      auto task_regions = task->GetReadRegions();
+      regions.insert(regions.end(), task_regions.begin(), task_regions.end());
+    }
+    if (then_child) {
+      auto r = then_child->GetReadRegions();
+      regions.insert(regions.end(), r.begin(), r.end());
+    }
+    if (else_child) {
+      auto r = else_child->GetReadRegions();
+      regions.insert(regions.end(), r.begin(), r.end());
+    }
+    return regions;
+  }
+  std::vector<BufferRegion> GetWriteRegions() const override {
+    std::vector<BufferRegion> regions;
+    if (task) {
+      auto task_regions = task->GetWriteRegions();
+      regions.insert(regions.end(), task_regions.begin(), task_regions.end());
+    }
+    if (then_child) {
+      auto r = then_child->GetWriteRegions();
+      regions.insert(regions.end(), r.begin(), r.end());
+    }
+    if (else_child) {
+      auto r = else_child->GetWriteRegions();
+      regions.insert(regions.end(), r.begin(), r.end());
+    }
+    return regions;
+  }
+
+  std::vector<Var> GetReadVars() const override {
+    std::vector<Var> vars;
+    if (task) {
+      auto v = task->GetReadVars();
+      vars.insert(vars.end(), v.begin(), v.end());
+    }
+    if (then_child) {
+      auto v = then_child->GetReadVars();
+      vars.insert(vars.end(), v.begin(), v.end());
+    }
+    if (else_child) {
+      auto v = else_child->GetReadVars();
+      vars.insert(vars.end(), v.begin(), v.end());
+    }
+    return vars;
+  }
+  std::vector<Var> GetWriteVars() const override {
+    std::vector<Var> vars;
+    if (task) {
+      auto v = task->GetWriteVars();
+      vars.insert(vars.end(), v.begin(), v.end());
+    }
+    if (then_child) {
+      auto v = then_child->GetWriteVars();
+      vars.insert(vars.end(), v.begin(), v.end());
+    }
+    if (else_child) {
+      auto v = else_child->GetWriteVars();
+      vars.insert(vars.end(), v.begin(), v.end());
+    }
+    return vars;
+  }
+
+  void SubstituteVar(const Var &old_var, const Var &new_var) override {
+    condition = Substitute(condition, {{old_var, new_var}});
+    if (then_child)
+      then_child->SubstituteVar(old_var, new_var);
+    if (else_child)
+      else_child->SubstituteVar(old_var, new_var);
+    if (task)
+      task->SubstituteVar(old_var, new_var);
+  }
+
+  // Latency = max of both branches
+  int64_t GetLatency() const override { return latency_; }
+  int64_t GetII() const override { return ii_; }
+
+  // Setters (delegate to both branches)
+  void SetUsesCUDACore(bool value) override {
+    if (then_child)
+      then_child->SetUsesCUDACore(value);
+    if (else_child)
+      else_child->SetUsesCUDACore(value);
+  }
+  void SetUsesTMACore(bool value) override {
+    if (then_child)
+      then_child->SetUsesTMACore(value);
+    if (else_child)
+      else_child->SetUsesTMACore(value);
+  }
+  void SetUsesTensorCore(bool value) override {
+    if (then_child)
+      then_child->SetUsesTensorCore(value);
+    if (else_child)
+      else_child->SetUsesTensorCore(value);
+  }
+  void SetReadRegions(const std::vector<BufferRegion> &regions) override {}
+  void SetWriteRegions(const std::vector<BufferRegion> &regions) override {}
+  void SetLatency(int64_t latency) override { latency_ = latency; }
+  void SetII(int64_t ii) override { ii_ = ii; }
+
+  void
+  CollectBufferAccessInfo(int num_wgs, SchedulePhase phase,
+                          std::set<BufferAccessInfo> &result) const override;
+
+  bool
+  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                          SchedulePhase phase,
+                          std::set<const TaskNode *> &result) const override;
+  bool
+  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                         SchedulePhase phase,
+                         std::set<const TaskNode *> &result) const override;
+
+  // Clone method
+  std::shared_ptr<IRStructure> Clone() const override;
+
+  bool containWarpgroupId(int id) const override {
+    return (then_child && then_child->containWarpgroupId(id)) ||
+           (else_child && else_child->containWarpgroupId(id));
+  }
+
+  bool ContainsLoopBreak() const override {
+    return (task && task->ContainsLoopBreak()) ||
+           (then_child && then_child->ContainsLoopBreak()) ||
+           (else_child && else_child->ContainsLoopBreak());
+  }
+
+private:
+  int64_t latency_{0};
+  int64_t ii_{0};
+};
+
 class ScheduleUnit : public IRStructure {
 public:
   int stage;
-  std::vector<std::vector<Stmt>> before, after;
+  std::map<int, std::vector<Stmt>> before, after;
   std::shared_ptr<IRStructure> child;
 
-  ScheduleUnit() {
-    for (unsigned idx = 0; idx != 2; ++idx) {
-      before.emplace_back();
-      after.emplace_back();
-    }
-  }
+  ScheduleUnit() {}
 
   Kind GetKind() const override { return Kind::kSchedule; }
 
@@ -590,6 +943,11 @@ public:
   }
   bool UsesTensorCore() const override {
     return child ? child->UsesTensorCore() : false;
+  }
+
+  bool HasWGMMA() const override { return child ? child->HasWGMMA() : false; }
+  bool HasTCGEN05() const override {
+    return child ? child->HasTCGEN05() : false;
   }
 
   // Memory access regions (aggregate from child)
@@ -611,12 +969,12 @@ public:
     if (child) {
       child->SubstituteVar(old_var, new_var);
     }
-    for (auto &stmts : before) {
+    for (auto &[_, stmts] : before) {
       for (auto &stmt : stmts) {
         stmt = Substitute(stmt, {{old_var, new_var}});
       }
     }
-    for (auto &stmts : after) {
+    for (auto &[_, stmts] : after) {
       for (auto &stmt : stmts) {
         stmt = Substitute(stmt, {{old_var, new_var}});
       }
@@ -651,9 +1009,18 @@ public:
   void SetLatency(int64_t latency) override { latency_ = latency; }
   void SetII(int64_t ii) override { ii_ = ii; }
 
-  void CollectRegions(
-      std::vector<RegionAccessInfo> &result,
-      std::set<std::pair<Buffer, std::pair<int, int>>> &visited) const override;
+  void
+  CollectBufferAccessInfo(int num_wgs, SchedulePhase phase,
+                          std::set<BufferAccessInfo> &result) const override;
+
+  bool
+  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                          SchedulePhase phase,
+                          std::set<const TaskNode *> &result) const override;
+  bool
+  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                         SchedulePhase phase,
+                         std::set<const TaskNode *> &result) const override;
 
   int GetStage() const { return stage; }
   bool isInnerTask() const { return child->IsTask(); }
@@ -662,12 +1029,27 @@ public:
     const TaskNode *task = static_cast<const TaskNode *>(child.get());
     return task->GetWarpgroupId();
   }
+  SchedulePhase GetSchedulePhase() const override {
+    if (!isInnerTask())
+      return SchedulePhase::kBody;
+    return static_cast<const TaskNode *>(child.get())->GetSchedulePhase();
+  }
+  bool IsNeutralPhase() const override {
+    return GetSchedulePhase() != SchedulePhase::kBody;
+  }
 
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;
 
   bool containWarpgroupId(int id) const override {
-    return child->containWarpgroupId(id);
+    if (before.count(id) > 0 || after.count(id) > 0) {
+      return true;
+    }
+    return child && child->containWarpgroupId(id);
+  }
+
+  bool ContainsLoopBreak() const override {
+    return child && child->ContainsLoopBreak();
   }
 
 private:
@@ -687,6 +1069,9 @@ public:
   bool UsesCUDACore() const override;
   bool UsesTMACore() const override;
   bool UsesTensorCore() const override;
+
+  bool HasWGMMA() const override;
+  bool HasTCGEN05() const override;
 
   // Memory access regions (aggregate from all children)
   std::vector<BufferRegion> GetReadRegions() const override;
@@ -714,9 +1099,18 @@ public:
   void SetLatency(int64_t latency) override;
   void SetII(int64_t ii) override;
 
-  void CollectRegions(
-      std::vector<RegionAccessInfo> &result,
-      std::set<std::pair<Buffer, std::pair<int, int>>> &visited) const override;
+  void
+  CollectBufferAccessInfo(int num_wgs, SchedulePhase phase,
+                          std::set<BufferAccessInfo> &result) const override;
+
+  bool
+  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                          SchedulePhase phase,
+                          std::set<const TaskNode *> &result) const override;
+  bool
+  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                         SchedulePhase phase,
+                         std::set<const TaskNode *> &result) const override;
 
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;
@@ -724,6 +1118,15 @@ public:
   bool containWarpgroupId(int id) const override {
     for (auto &child : children) {
       if (child->containWarpgroupId(id)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool ContainsLoopBreak() const override {
+    for (const auto &child : children) {
+      if (child->ContainsLoopBreak()) {
         return true;
       }
     }
@@ -767,12 +1170,16 @@ inline MemoryType GetMemoryTypeFromScope(const String &scope) {
   return MemoryType::kUnknown;
 }
 
-// Helper function to check if a buffer region is in register memory
-inline bool IsRegisterRegion(const BufferRegion &region) {
-  const Buffer &buffer = region->buffer;
+// Helper function to check if a buffer is in register memory
+inline bool IsRegisterBuffer(const Buffer &buffer) {
   String scope = buffer.scope();
   MemoryType mem_type = GetMemoryTypeFromScope(scope);
   return mem_type == MemoryType::kRegister;
+}
+
+// Helper function to check if a buffer region is in register memory
+inline bool IsRegisterRegion(const BufferRegion &region) {
+  return IsRegisterBuffer(region->buffer);
 }
 
 // Helper function to collect all register regions from an IRStructure node
@@ -853,6 +1260,7 @@ CollectTopLevelControlNodes(IRStructure *node,
     auto unit = static_cast<ScheduleUnit *>(node);
     CollectTopLevelControlNodes(unit->child.get(), control_nodes);
   }
+  // IfNode is atomic — don't recurse into it
 }
 
 // Collect all TaskNodes at the top level (not inside any ControlNode)
@@ -874,6 +1282,7 @@ inline void CollectTopLevelTaskNodes(IRStructure *node,
     auto unit = static_cast<ScheduleUnit *>(node);
     CollectTopLevelTaskNodes(unit->child.get(), task_nodes);
   }
+  // IfNode is atomic — don't recurse into it
 }
 
 // Collect all top-level leaf items (TaskNodes and ControlNodes) in order.
@@ -883,7 +1292,7 @@ inline void CollectTopLevelItems(IRStructure *node,
                                  std::vector<IRStructure *> &items) {
   if (!node)
     return;
-  if (node->IsTask() || node->IsControl()) {
+  if (node->IsTask() || node->IsControl() || node->IsIf()) {
     items.push_back(node);
   } else if (node->IsSequence()) {
     auto seq = static_cast<SequenceNode *>(node);
@@ -995,13 +1404,13 @@ inline void PrintAllStmts(const IRStructure *node, int indent = 0) {
     const ScheduleUnit *promote = static_cast<const ScheduleUnit *>(node);
     LOG(INFO) << indent_str << "ScheduleUnit:";
     LOG(INFO) << indent_str << "  Promote: " << promote->stage;
-    for (unsigned idx = 0; idx != promote->before.size(); ++idx) {
-      for (auto &stmt : promote->before[idx]) {
+    for (const auto &[idx, stmts] : promote->before) {
+      for (const auto &stmt : stmts) {
         LOG(INFO) << indent_str << "  Before " << idx << " : " << stmt;
       }
     }
-    for (unsigned idx = 0; idx != promote->after.size(); ++idx) {
-      for (auto &stmt : promote->after[idx]) {
+    for (const auto &[idx, stmts] : promote->after) {
+      for (const auto &stmt : stmts) {
         LOG(INFO) << indent_str << "  After " << idx << " : " << stmt;
       }
     }
@@ -1009,6 +1418,18 @@ inline void PrintAllStmts(const IRStructure *node, int indent = 0) {
     if (promote->child) {
       LOG(INFO) << indent_str << "  Promote body:";
       PrintAllStmts(promote->child.get(), indent + 2);
+    }
+  } else if (node->IsIf()) {
+    const IfNode *if_node = static_cast<const IfNode *>(node);
+    LOG(INFO) << indent_str << "IfNode:";
+    LOG(INFO) << indent_str << "  Condition: " << if_node->condition;
+    if (if_node->then_child) {
+      LOG(INFO) << indent_str << "  Then:";
+      PrintAllStmts(if_node->then_child.get(), indent + 2);
+    }
+    if (if_node->else_child) {
+      LOG(INFO) << indent_str << "  Else:";
+      PrintAllStmts(if_node->else_child.get(), indent + 2);
     }
   }
 }
@@ -1062,6 +1483,13 @@ inline void PrintIRStructure(const IRStructure *node, int indent = 0) {
     LOG(INFO) << indent_str << "  latency: " << task->GetLatency() << " cycles";
     LOG(INFO) << indent_str << "  II: " << task->GetII() << " cycles";
     LOG(INFO) << indent_str << "  warpgroup_id: " << task->GetWarpgroupId();
+    LOG(INFO) << indent_str << "  schedule_phase: "
+              << static_cast<int>(task->GetSchedulePhase())
+              << (task->GetSchedulePhase() == SchedulePhase::kPrologue
+                      ? " (prologue)"
+                  : task->GetSchedulePhase() == SchedulePhase::kEpilogue
+                      ? " (epilogue)"
+                      : " (body)");
   } else if (node->IsControl()) {
     const ControlNode *control = static_cast<const ControlNode *>(node);
     LOG(INFO) << indent_str << "ControlNode (For loop):";
@@ -1091,19 +1519,35 @@ inline void PrintIRStructure(const IRStructure *node, int indent = 0) {
     const ScheduleUnit *promote = static_cast<const ScheduleUnit *>(node);
     LOG(INFO) << indent_str << "ScheduleUnit:";
     LOG(INFO) << indent_str << "  Promote: " << promote->stage;
-    for (unsigned idx = 0; idx != promote->before.size(); ++idx) {
-      for (auto &stmt : promote->before[idx]) {
+    for (const auto &[idx, stmts] : promote->before) {
+      for (const auto &stmt : stmts) {
         LOG(INFO) << indent_str << "  Before " << idx << " : " << stmt;
       }
     }
-    for (unsigned idx = 0; idx != promote->after.size(); ++idx) {
-      for (auto &stmt : promote->after[idx]) {
+    for (const auto &[idx, stmts] : promote->after) {
+      for (const auto &stmt : stmts) {
         LOG(INFO) << indent_str << "  After " << idx << " : " << stmt;
       }
     }
     if (promote->child) {
       LOG(INFO) << indent_str << "  Promote body:";
-      PrintAllStmts(promote->child.get(), indent + 2);
+      PrintIRStructure(promote->child.get(), indent + 2);
+    }
+  } else if (node->IsIf()) {
+    const IfNode *if_node = static_cast<const IfNode *>(node);
+    LOG(INFO) << indent_str << "IfNode:";
+    LOG(INFO) << indent_str << "  Condition: " << if_node->condition;
+    if (if_node->task) {
+      LOG(INFO) << indent_str << "  Task:";
+      PrintIRStructure(if_node->task.get(), indent + 4);
+    }
+    if (if_node->then_child) {
+      LOG(INFO) << indent_str << "  Then:";
+      PrintIRStructure(if_node->then_child.get(), indent + 2);
+    }
+    if (if_node->else_child) {
+      LOG(INFO) << indent_str << "  Else:";
+      PrintIRStructure(if_node->else_child.get(), indent + 2);
     }
   }
 }

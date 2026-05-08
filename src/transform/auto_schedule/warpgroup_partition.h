@@ -35,12 +35,24 @@ bool ContainsLetDecl(const IRStructure *node);
 
 std::shared_ptr<IRStructure>
 CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
+                                    Map<Var, PrimExpr> &var_remap,
+                                    Map<Buffer, Buffer> &buffer_remap);
+std::shared_ptr<IRStructure>
+CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
                                     Map<Var, PrimExpr> &var_remap);
 std::shared_ptr<IRStructure>
 CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id);
 
-std::shared_ptr<IRStructure>
-RemoveUnusedLetDecls(std::shared_ptr<IRStructure> root);
+std::vector<std::shared_ptr<IRStructure>>
+CloneIRStructureChildrenWithWarpgroupFilter(SequenceNode *root_seq,
+                                            int warpgroup_id,
+                                            Map<Var, PrimExpr> &var_remap,
+                                            Map<Buffer, Buffer> &buffer_remap);
+
+std::vector<std::shared_ptr<IRStructure>>
+CloneIRStructureChildrenWithWarpgroupFilter(SequenceNode *root_seq,
+                                            int warpgroup_id,
+                                            Map<Var, PrimExpr> &var_remap);
 
 class SimtCopyDetector;
 
@@ -49,10 +61,13 @@ Stmt ConvertIRStructureToStmt(IRStructure *root, const bool outer_enable_epi);
 Stmt ApplyWarpgroupPartitionToIRStructure(
     IRStructure *root, IterVar thread_var, std::vector<Buffer> &barrier_buffers,
     Map<ObjectRef, ObjectRef> &barrier_map, const bool enable_epi,
-    PrimExpr thread_count[2], bool producer_consumer,
-    const WarpSpecializeConfig &config, Buffer neutral_sync_shared_barrier);
+    const std::vector<PrimExpr> &thread_count,
+    const WarpSpecializeConfig &config, Buffer neutral_sync_shared_barrier,
+    std::vector<Buffer> &duplicated_fragment_buffers);
 
 Stmt ReNestLetStmts(const Stmt &stmt);
+
+Stmt StripUnusedLetStmts(const Stmt &stmt);
 
 } // namespace tl
 } // namespace tvm

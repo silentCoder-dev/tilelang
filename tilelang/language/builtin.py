@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import tvm.script.parser.tir as T
 from tilelang._typing import BufferLikeType, BufferLikeTypeTuple, BarrierType, DType
 from tilelang import tvm as tvm
 from tilelang.language import ptx_arrive_barrier, evaluate
+from tilelang.language.eager.builder import macro
 from tilelang.language.kernel import get_thread_bindings, get_block_extents
 from tilelang.utils.target import check_hip_availability
 from tvm import DataType, tir
 from tvm.runtime import convert
 from tvm.tir import PrimExpr, Var, Call, BufferLoad, BufferRegion
-from tilelang.utils.language import retrieve_ptr
+from tilelang.utils.language import retrieve_ptr, get_buffer_region_from_load, retrieve_buffer_and_offset
 
 _IS_HIP_AVAILABLE = check_hip_availability()
 
@@ -252,6 +254,32 @@ def access_ptr(
     )
 
 
+def deallocate_tmem(tmem: tir.Buffer) -> None:
+    """Explicitly deallocate a TMEM buffer allocated by ``T.alloc_tmem``.
+
+    By default, TileLang inserts a TMEM deallocation automatically at the end
+    of the allocation block. Calling ``T.deallocate_tmem(buf)`` suppresses that
+    automatic tail deallocation for ``buf`` and lowers an explicit deallocation
+    at the call site instead.
+
+    Notes:
+    - The deallocation must obey the hardware TMEM rules: it should be issued by
+      the same warp that performed the allocation.
+    - Once this API is used, the buffer lifetime is user-managed for the current
+      block; deallocating too early or conditionally is the user's responsibility.
+
+    Args:
+        tmem: A TMEM buffer previously returned by ``T.alloc_tmem``.
+    """
+
+    if not isinstance(tmem, tir.Buffer):
+        raise TypeError(f"T.deallocate_tmem expects a tvm.tir.Buffer, but got {type(tmem)}.")
+    if tmem.scope() != "shared.tmem":
+        raise ValueError(f"T.deallocate_tmem expects a shared.tmem buffer, but got scope={tmem.scope()}.")
+
+    return evaluate(tir.call_intrin("handle", tir.op.Op.get("tl.deallocate_tmem"), tmem.data))
+
+
 def create_tma_descriptor(*args):
     """Create a Tensor Memory Access (TMA) descriptor.
 
@@ -468,6 +496,14 @@ def mbarrier_expect_tx(mbarrier: BarrierType, tx: int):
     """
     mbarrier = _mbar_to_buffer_load(mbarrier)
     return tir.call_intrin("handle", tir.op.Op.get("tl.mbarrier_expect_tx"), mbarrier, tx)
+
+
+def mbarrier_arrive_expect_tx(mbarrier: BarrierType, tx: int):
+    """Arrive at a memory barrier and expect completion of async transactions."""
+    from tilelang.language.tir.op import ptx_arrive_barrier_expect_tx
+
+    mbarrier = _mbar_to_buffer_load(mbarrier)
+    return ptx_arrive_barrier_expect_tx(mbarrier, tx)
 
 
 def warpgroup_arrive():
@@ -840,47 +876,57 @@ def barrier_arrive(mbarrier: BarrierType):
     return mbarrier_arrive(mbarrier)
 
 
-def shfl_xor(value: int | PrimExpr | tir.Call, offset: int | PrimExpr | tir.Call):
-    """Perform a shuffle operation with XOR offset.
+# Full-warp mask as a proper uint32 TIR constant so the emitted C/C++ source
+# prints as `0xFFFFFFFFu` instead of `(int64_t)4294967295` after TIR widening.
+_FULL_WARP_MASK = tir.const(0xFFFFFFFF, "uint32")
+_DEFAULT_SHFL_WIDTH = 32
 
-    Args:
-        value: Optional[int, PrimExpr]
-            The value to shuffle
-        offset: Optional[int, PrimExpr]
-            The offset for the shuffle operation
-    Returns:
-        tir.Call: A handle to the shuffle operation
+
+def _as_uint32_mask(mask: int | PrimExpr) -> PrimExpr:
+    """Normalize a warp lane mask to a uint32 TIR expression.
+
+    Python literals (e.g. ``0xFFFFFFFF``) would otherwise be widened to int64
+    by TIR and printed as ``(int64_t)4294967295`` in the generated source.
     """
-    if _IS_HIP_AVAILABLE:
-        return tir.call_extern(value.dtype, "__shfl_xor", value, offset)
-    else:
-        return tir.call_extern(value.dtype, "__shfl_xor_sync", 0xFFFFFFFF, value, offset)
+    if isinstance(mask, int):
+        return tir.const(mask, "uint32")
+    return mask
 
 
-def shfl_down(value: int | PrimExpr | tir.Call, offset: int | PrimExpr | tir.Call):
-    """Perform a shuffle operation with down offset.
-
-    Args:
-        value: Optional[int, PrimExpr]
-            The value to shuffle
+def shfl_xor(
+    value: int | PrimExpr | tir.Call,
+    delta: int | PrimExpr | tir.Call,
+    width: int | PrimExpr = _DEFAULT_SHFL_WIDTH,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+):
+    """XOR-swap ``value`` across lanes (``__shfl_xor_sync`` on CUDA,
+    ``__shfl_xor`` on HIP — mask ignored on HIP).
     """
-    if _IS_HIP_AVAILABLE:
-        return tir.call_extern(value.dtype, "__shfl_down", value, offset)
-    else:
-        return tir.call_extern(value.dtype, "__shfl_down_sync", 0xFFFFFFFF, value, offset)
+    return tir.call_intrin(value.dtype, tir.op.Op.get("tl.shfl_xor_sync"), _as_uint32_mask(mask), value, delta, width)
 
 
-def shfl_up(value: int | PrimExpr | tir.Call, offset: int | PrimExpr | tir.Call):
-    """Perform a shuffle operation with up offset.
-
-    Args:
-        value: Optional[int, PrimExpr]
-            The value to shuffle
+def shfl_down(
+    value: int | PrimExpr | tir.Call,
+    delta: int | PrimExpr | tir.Call,
+    width: int | PrimExpr = _DEFAULT_SHFL_WIDTH,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+):
+    """Shift ``value`` down by ``delta`` lanes (``__shfl_down_sync`` on CUDA,
+    ``__shfl_down`` on HIP).
     """
-    if _IS_HIP_AVAILABLE:
-        return tir.call_extern(value.dtype, "__shfl_up", value, offset)
-    else:
-        return tir.call_extern(value.dtype, "__shfl_up_sync", 0xFFFFFFFF, value, offset)
+    return tir.call_intrin(value.dtype, tir.op.Op.get("tl.shfl_down_sync"), _as_uint32_mask(mask), value, delta, width)
+
+
+def shfl_up(
+    value: int | PrimExpr | tir.Call,
+    delta: int | PrimExpr | tir.Call,
+    width: int | PrimExpr = _DEFAULT_SHFL_WIDTH,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+):
+    """Shift ``value`` up by ``delta`` lanes (``__shfl_up_sync`` on CUDA,
+    ``__shfl_up`` on HIP).
+    """
+    return tir.call_intrin(value.dtype, tir.op.Op.get("tl.shfl_up_sync"), _as_uint32_mask(mask), value, delta, width)
 
 
 def sync_threads(barrier_id: int = None, arrive_count: int = None):
@@ -900,11 +946,157 @@ def sync_warp(mask: int = None):
     return tir.call_intrin("void", tir.op.Op.get("tl.sync_warp"))
 
 
-def shfl_sync(mask: int, value: int | PrimExpr, srcLane: int, width: int = None):
-    """Receives data from a thread in the same warp."""
-    if width is None:
-        return tir.call_extern(value.dtype, "__shfl_sync", mask, value, srcLane)
-    return tir.call_extern(value.dtype, "__shfl_sync", mask, value, srcLane, width)
+def shfl_sync(
+    value: int | PrimExpr,
+    srcLane: int | PrimExpr,
+    width: int | PrimExpr = _DEFAULT_SHFL_WIDTH,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+):
+    """Broadcast ``value`` from ``srcLane`` to all lanes in the subgroup of
+    ``width`` lanes (``__shfl_sync`` on CUDA, ``__shfl`` on HIP — mask ignored
+    on HIP).
+    """
+    return tir.call_intrin(value.dtype, tir.op.Op.get("tl.shfl_sync"), _as_uint32_mask(mask), value, srcLane, width)
+
+
+# ---------------------------------------------------------------------------
+# Warp-vote / warp-ballot intrinsics
+#
+# The CUDA/HIP split and the uint32->uint64 zero-extension for ballot_sync and
+# activemask are handled in codegen (src/target/codegen_{cuda,hip}.cc). These
+# Python wrappers simply emit the backend-agnostic tl.* ops.
+# ---------------------------------------------------------------------------
+
+
+def any_sync(
+    predicate: int | PrimExpr,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+) -> PrimExpr:
+    """Non-zero if ANY active lane in ``mask`` has a non-zero ``predicate``.
+
+    Lowers to ``__any_sync(mask, predicate)`` on CUDA and ``__any(predicate)``
+    on HIP (the mask is ignored on HIP because the full wavefront is always
+    convergent).
+
+    Args:
+        predicate: Integer condition to test.
+        mask: Warp lane mask (defaults to ``0xFFFFFFFF``, i.e. all 32 lanes).
+
+    Returns:
+        int32: Non-zero if any thread in the mask has a non-zero predicate.
+    """
+    return tir.call_intrin("int32", tir.op.Op.get("tl.any_sync"), _as_uint32_mask(mask), predicate)
+
+
+def all_sync(
+    predicate: int | PrimExpr,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+) -> PrimExpr:
+    """Non-zero only if ALL active lanes in ``mask`` have a non-zero predicate.
+
+    Lowers to ``__all_sync(mask, predicate)`` on CUDA and ``__all(predicate)``
+    on HIP.
+
+    Args:
+        predicate: Integer condition to test.
+        mask: Warp lane mask (defaults to ``0xFFFFFFFF``, i.e. all 32 lanes).
+
+    Returns:
+        int32: Non-zero if all threads in the mask have a non-zero predicate.
+    """
+    return tir.call_intrin("int32", tir.op.Op.get("tl.all_sync"), _as_uint32_mask(mask), predicate)
+
+
+def ballot_sync(
+    predicate: int | PrimExpr,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+) -> PrimExpr:
+    """Return a ``uint64`` bitmask of lanes in ``mask`` whose predicate is set.
+
+    CUDA: ``__ballot_sync(mask, predicate)`` returns ``unsigned int``; codegen
+    zero-extends it to ``uint64`` (upper 32 bits always zero for 32-wide warps).
+    HIP: ``__ballot(predicate)`` returns ``uint64`` natively, covering all
+    64 wavefront lanes. The mask argument is ignored on HIP.
+
+    Returns:
+        uint64: Bitmask with bit N set if lane N's predicate is non-zero.
+    """
+    return tir.call_intrin("uint64", tir.op.Op.get("tl.ballot_sync"), _as_uint32_mask(mask), predicate)
+
+
+def ballot(predicate: int | PrimExpr) -> PrimExpr:
+    """Full-warp / full-wavefront ballot. Equivalent to
+    ``ballot_sync(predicate)`` (i.e. with the default full warp mask).
+
+    Returns:
+        uint64: Bitmask with bit N set if lane N's predicate is non-zero.
+    """
+    return tir.call_intrin("uint64", tir.op.Op.get("tl.ballot"), predicate)
+
+
+def activemask() -> PrimExpr:
+    """Return a ``uint64`` bitmask of currently active (non-exited) lanes.
+
+    Lowers to ``__activemask()`` (zero-extended to ``uint64``) on CUDA and
+    ``__ballot(1)`` on HIP.
+    """
+    return tir.call_intrin("uint64", tir.op.Op.get("tl.activemask"))
+
+
+# ---------------------------------------------------------------------------
+# Thread-block synchronization with predicate (shared across CUDA & HIP)
+# ---------------------------------------------------------------------------
+
+
+def syncthreads_count(predicate: int | PrimExpr) -> PrimExpr:
+    """Block barrier that returns the number of threads whose ``predicate``
+    evaluates to non-zero (``__syncthreads_count`` on CUDA and HIP).
+    """
+    return tir.call_intrin("int32", tir.op.Op.get("tl.syncthreads_count"), predicate)
+
+
+def syncthreads_and(predicate: int | PrimExpr) -> PrimExpr:
+    """Block barrier that returns non-zero only if ALL threads have a non-zero
+    ``predicate`` (``__syncthreads_and`` on CUDA and HIP).
+    """
+    return tir.call_intrin("int32", tir.op.Op.get("tl.syncthreads_and"), predicate)
+
+
+def syncthreads_or(predicate: int | PrimExpr) -> PrimExpr:
+    """Block barrier that returns non-zero if ANY thread has a non-zero
+    ``predicate`` (``__syncthreads_or`` on CUDA and HIP).
+    """
+    return tir.call_intrin("int32", tir.op.Op.get("tl.syncthreads_or"), predicate)
+
+
+# ---------------------------------------------------------------------------
+# Warp match intrinsics (CUDA sm_70+; unsupported on HIP)
+# ---------------------------------------------------------------------------
+
+
+def match_any_sync(
+    value: int | PrimExpr,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+) -> PrimExpr:
+    """Return a ``uint32`` bitmask of lanes in ``mask`` whose ``value`` equals
+    the calling lane's value. Lowers to ``__match_any_sync`` on CUDA
+    (compute capability >= 7.0). Not supported on HIP.
+    """
+    return tir.call_intrin("uint32", tir.op.Op.get("tl.match_any_sync"), _as_uint32_mask(mask), value)
+
+
+def match_all_sync(
+    value: int | PrimExpr,
+    mask: int | PrimExpr = _FULL_WARP_MASK,
+) -> PrimExpr:
+    """Return ``mask`` if all lanes in ``mask`` agree on ``value``, else 0.
+
+    Lowers to ``__match_all_sync`` on CUDA (compute capability >= 7.0); the
+    trailing ``int*`` predicate output is hidden in codegen and discarded.
+    Callers can reconstruct the predicate as ``result != 0``. Not supported
+    on HIP.
+    """
+    return tir.call_intrin("uint32", tir.op.Op.get("tl.match_all_sync"), _as_uint32_mask(mask), value)
 
 
 def sync_global():
@@ -1035,6 +1227,89 @@ def tcgen05_mma_arrive(mbar: tir.Buffer | BufferLoad | PrimExpr, arrive_2cta: bo
     return tir.call_intrin("void", tir.op.Op.get("tl.tcgen05_mma_arrive"), mbar, annotations=ann)
 
 
+def tcgen05_before_thread_sync():
+    return tir.call_intrin("void", tir.op.Op.get("tl.tcgen05_before_thread_sync"))
+
+
+def tcgen05_after_thread_sync():
+    return tir.call_intrin("void", tir.op.Op.get("tl.tcgen05_after_thread_sync"))
+
+
+def _tcgen05_num_smem_chunks(smem_src, chunk_elems: int):
+    if isinstance(smem_src, tir.Buffer):
+        shape = list(smem_src.shape)
+    elif isinstance(smem_src, tir.BufferRegion):
+        shape = [r.extent for r in smem_src.region]
+    elif isinstance(smem_src, tir.BufferLoad):
+        region = get_buffer_region_from_load(smem_src)
+        if region is None:
+            raise TypeError("T.tcgen05_cp_warpx4 requires Buffer/BufferRegion-like scale-factor sources.")
+        shape = [r.extent for r in region.region]
+    else:
+        raise TypeError(f"Unsupported scale-factor buffer type: {type(smem_src)}")
+
+    total_elems = 1
+    for extent in shape:
+        if not isinstance(extent, tir.IntImm):
+            raise ValueError("Packed scale-factor helpers require a static extent.")
+        total_elems *= extent.value
+    if total_elems % chunk_elems != 0:
+        raise ValueError(f"Packed scale-factor helpers require total extent to be a multiple of {chunk_elems}, got {total_elems}.")
+    return total_elems // chunk_elems
+
+
+def tcgen05_cp_warpx4(smem_src, tmem_dst, tmem_col_offset=0, *, use_2cta: bool = False):
+    """Copy one or more packed scale-factor chunks from shared memory to tensor memory.
+
+    The helper lowers to one or more ``tcgen05.cp.cta_group::{1,2}.32x128b.warpx4``
+    instructions. For 1D packed ``uint32`` scale buffers, each 128-word chunk maps to
+    4 TMEM columns and the column offset is advanced automatically.
+    """
+    num_chunks = _tcgen05_num_smem_chunks(smem_src, 128)
+    if isinstance(tmem_dst, tir.Buffer):
+        tmem_ptr = tmem_dst.data
+    elif isinstance(tmem_dst, (BufferLoad, BufferRegion)):
+        tmem_ptr = tmem_dst.buffer.data
+    else:
+        tmem_ptr = tmem_dst
+    ann = {"use_2cta": 1} if use_2cta else None
+    buffer, base_offset = retrieve_buffer_and_offset(smem_src)
+
+    @macro
+    def _tcgen05_cp_warpx4_chunked(buffer, tmem_ptr, tmem_col_offset, base_offset):
+        for i in T.unroll(num_chunks):
+            chunk_ptr = buffer.access_ptr("r", offset=base_offset + i * 128)
+            tir.call_intrin(
+                "void",
+                tir.op.Op.get("tl.ptx_tcgen05_cp_warpx4"),
+                chunk_ptr,
+                tmem_ptr,
+                tmem_col_offset + i * 4,
+                annotations=ann,
+            )
+
+    return _tcgen05_cp_warpx4_chunked(buffer, tmem_ptr, tmem_col_offset, base_offset)
+
+
+def tcgen05_sf_warp_transpose(smem_src):
+    """Warp-level transpose for one or more packed scale-factor chunks in shared memory.
+
+    For 1D packed ``uint32`` scale buffers, the helper automatically applies the
+    transpose to each 128-word chunk in order.
+    """
+    num_chunks = _tcgen05_num_smem_chunks(smem_src, 128)
+
+    buffer, base_offset = retrieve_buffer_and_offset(smem_src)
+
+    @macro
+    def _tcgen05_sf_warp_transpose_chunked(buffer, base_offset):
+        for i in T.unroll(num_chunks):
+            chunk_ptr = buffer.access_ptr("rw", offset=base_offset + i * 128)
+            tir.call_intrin("void", tir.op.Op.get("tl.ptx_tcgen05_sf_warp_transpose"), chunk_ptr)
+
+    return _tcgen05_sf_warp_transpose_chunked(buffer, base_offset)
+
+
 def ptx_mma_sm70(
     shape,
     A_layout,
@@ -1132,6 +1407,48 @@ def ptx_mma_sm70(
         accumulator,
         c_index,
     )
+
+
+def ds_read_tr16_b64(src: BufferLikeType) -> PrimExpr:
+    """LDS transpose read, 64-bit, 16-element transpose (gfx950 only).
+
+    Reads 8 bytes from LDS (__shared__ memory) with a 16-element transpose.
+    Used for FP16/BF16 MFMA matrix B-loads on MI350/MI355X (gfx950).
+
+    Args:
+        src: A `Buffer`, `BufferRegion`, or `BufferLoad` in shared memory.
+
+    Returns:
+        PrimExpr: The loaded 64-bit value as uint32x2.
+
+    Example:
+        >>> val = T.ds_read_tr16_b64(smem[i])
+    """
+    if not isinstance(src, BufferLikeTypeTuple):
+        raise TypeError(f"T.ds_read_tr16_b64 expects Buffer, BufferRegion, or BufferLoad. Got {type(src)}: {src}")
+    ptr = retrieve_ptr(src, access_type="r")
+    return tir.call_intrin("uint32x2", tir.op.Op.get("tl.ds_read_tr16_b64"), ptr)
+
+
+def ds_read_tr8_b64(src: BufferLikeType) -> PrimExpr:
+    """LDS transpose read, 64-bit, 8-element transpose (gfx950 only).
+
+    Reads 8 bytes from LDS (__shared__ memory) with an 8-element transpose.
+    Used for FP32 MFMA matrix B-loads on MI350/MI355X (gfx950).
+
+    Args:
+        src: A `Buffer`, `BufferRegion`, or `BufferLoad` in shared memory.
+
+    Returns:
+        PrimExpr: The loaded 64-bit value as uint32x2.
+
+    Example:
+        >>> val = T.ds_read_tr8_b64(smem[i])
+    """
+    if not isinstance(src, BufferLikeTypeTuple):
+        raise TypeError(f"T.ds_read_tr8_b64 expects Buffer, BufferRegion, or BufferLoad. Got {type(src)}: {src}")
+    ptr = retrieve_ptr(src, access_type="r")
+    return tir.call_intrin("uint32x2", tir.op.Op.get("tl.ds_read_tr8_b64"), ptr)
 
 
 def ldg32(src: BufferLikeType, pred: PrimExpr = None) -> PrimExpr:

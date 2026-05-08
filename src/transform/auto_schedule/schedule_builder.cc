@@ -46,6 +46,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -59,7 +60,7 @@
 #include <vector>
 
 #include "../../op/builtin.h"
-#include "../../op/gemm_py.h"
+#include "../../op/gemm.h"
 #include "../../op/utils.h"
 #include "../../target/utils.h"
 #include "../common/attr.h"
@@ -89,6 +90,8 @@ void GatherTaskNodes(const std::vector<std::shared_ptr<IRStructure>> &nodes,
         GatherTaskNodesSingle(wrapper->child, task_nodes);
     } else if (node->IsControl()) {
       task_nodes.emplace_back(node);
+    } else if (node->IsIf()) {
+      task_nodes.emplace_back(node);
     } else {
       LOG(FATAL) << "Unknown node type in GatherTaskNodes";
     }
@@ -107,17 +110,26 @@ bool SameBuffer(const BufferRegion &a, const BufferRegion &b) {
 
 bool SameVar(const Var &a, const Var &b) { return a.same_as(b); }
 
+bool IsAttrInTask(const IRStructure *a) {
+  if (!a->IsTask()) {
+    return false;
+  }
+  auto task = static_cast<const TaskNode *>(a);
+  for (const auto &stmt : task->stmts) {
+    if (stmt.as<AttrStmtNode>()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool HasDependency(const IRStructure *a, const IRStructure *b) {
-  if (a->IsTask()) {
-    const TaskNode *task_a = static_cast<const TaskNode *>(a);
-    if (task_a->ContainsLoopBreak())
-      return true;
-  }
-  if (b->IsTask()) {
-    const TaskNode *task_b = static_cast<const TaskNode *>(b);
-    if (task_b->ContainsLoopBreak())
-      return true;
-  }
+  if (a->ContainsLoopBreak())
+    return true;
+  if (b->ContainsLoopBreak())
+    return true;
+  if (IsAttrInTask(a) || IsAttrInTask(b))
+    return true;
   for (const auto &write_region_a : a->GetWriteRegions()) {
     for (const auto &read_region_b : b->GetReadRegions()) {
       if (SameBuffer(write_region_a, read_region_b))
@@ -140,20 +152,20 @@ bool HasDependency(const IRStructure *a, const IRStructure *b) {
         return true;
     }
   }
+  for (const auto &read_var_a : a->GetReadVars()) {
+    for (const auto &write_var_b : b->GetWriteVars()) {
+      if (SameVar(read_var_a, write_var_b))
+        return true;
+    }
+  }
   return false;
 }
 
 bool HasRegisterDependency(const IRStructure *a, const IRStructure *b) {
-  if (a->IsTask()) {
-    const TaskNode *task_a = static_cast<const TaskNode *>(a);
-    if (task_a->ContainsLoopBreak())
-      return true;
-  }
-  if (b->IsTask()) {
-    const TaskNode *task_b = static_cast<const TaskNode *>(b);
-    if (task_b->ContainsLoopBreak())
-      return true;
-  }
+  if (a->ContainsLoopBreak())
+    return true;
+  if (b->ContainsLoopBreak())
+    return true;
   for (const auto &write_region_a : a->GetWriteRegions()) {
     if (IsSharedBuffer(write_region_a.get()->buffer))
       continue;
@@ -207,6 +219,240 @@ bool HasRegisterRegion(const IRStructure *node) {
   return CountRegisterRegions(node) > 0;
 }
 
+// Collect register buffers read by all broadcast tasks in the IR tree.
+static void CollectBroadcastRegisterReads(
+    IRStructure *node, std::unordered_set<const BufferNode *> &reg_bufs) {
+  if (!node)
+    return;
+  auto collect_from_leaf_task = [&](const TaskNode *task) {
+    if (!task)
+      return;
+    int wg_id = task->GetWarpgroupId();
+    if (!IsWarpgroupBroadcast(wg_id) && wg_id != kWarpgroupUnassigned)
+      return;
+    for (const auto &region : task->GetReadRegions()) {
+      if (IsRegisterRegion(region)) {
+        reg_bufs.insert(region->buffer.get());
+      }
+    }
+  };
+  auto collect_from_structural_task = [&](const TaskNode *task) {
+    if (!task)
+      return;
+    for (const auto &region : task->GetReadRegions()) {
+      if (IsRegisterRegion(region)) {
+        reg_bufs.insert(region->buffer.get());
+      }
+    }
+  };
+
+  if (node->IsTask()) {
+    collect_from_leaf_task(static_cast<TaskNode *>(node));
+  } else if (node->IsControl()) {
+    auto ctrl = static_cast<ControlNode *>(node);
+    if (ctrl->task)
+      collect_from_structural_task(ctrl->task.get());
+    CollectBroadcastRegisterReads(ctrl->child.get(), reg_bufs);
+  } else if (node->IsWrapper()) {
+    auto wrapper = static_cast<WrapperNode *>(node);
+    if (wrapper->task)
+      collect_from_structural_task(wrapper->task.get());
+    CollectBroadcastRegisterReads(wrapper->child.get(), reg_bufs);
+  } else if (node->IsSequence()) {
+    auto seq = static_cast<SequenceNode *>(node);
+    for (auto &child : seq->children) {
+      CollectBroadcastRegisterReads(child.get(), reg_bufs);
+    }
+  } else if (node->IsScheduleUnit()) {
+    auto unit = static_cast<ScheduleUnit *>(node);
+    CollectBroadcastRegisterReads(unit->child.get(), reg_bufs);
+  } else if (node->IsIf()) {
+    auto if_node = static_cast<IfNode *>(node);
+    if (if_node->task)
+      collect_from_structural_task(if_node->task.get());
+    CollectBroadcastRegisterReads(if_node->then_child.get(), reg_bufs);
+    if (if_node->else_child)
+      CollectBroadcastRegisterReads(if_node->else_child.get(), reg_bufs);
+  }
+}
+
+// Propagate broadcast: if a broadcast task reads a register buffer,
+// any leaf task that writes that register buffer must also be broadcast
+// (because each wg needs its own initialized copy).
+void PropagateBroadcastWarpgroupId(IRStructure *root) {
+  std::vector<TaskNodeWithContext> all_tasks;
+  CollectAllTaskNodesWithContext(root, all_tasks);
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    // 1. Collect register buffers read by all current broadcast tasks
+    std::unordered_set<const BufferNode *> broadcast_reg_reads;
+    CollectBroadcastRegisterReads(root, broadcast_reg_reads);
+    // Also collect from leaf broadcast tasks
+    for (auto &task_ctx : all_tasks) {
+      TaskNode *task = task_ctx.task;
+      if (!IsWarpgroupBroadcast(task->GetWarpgroupId()))
+        continue;
+      for (const auto &region : task->GetReadRegions()) {
+        if (IsRegisterRegion(region)) {
+          broadcast_reg_reads.insert(region->buffer.get());
+        }
+      }
+    }
+    // 2. Mark leaf tasks that write these register buffers as broadcast
+    if (!broadcast_reg_reads.empty()) {
+      for (auto &task_ctx : all_tasks) {
+        TaskNode *task = task_ctx.task;
+        if (IsWarpgroupBroadcast(task->GetWarpgroupId()))
+          continue;
+        for (const auto &region : task->GetWriteRegions()) {
+          if (IsRegisterRegion(region) &&
+              broadcast_reg_reads.count(region->buffer.get())) {
+            task->SetWarpgroupId(kWarpgroupBroadcast);
+            changed = true;
+            break;
+          }
+        }
+      }
+    }
+
+    // 3. Detect cross-warpgroup register buffer / scalar-var accesses
+    constexpr int kReaderAnyWg = std::numeric_limits<int>::min();
+    std::unordered_map<const BufferNode *, std::unordered_set<int>>
+        buffer_reader_wgs;
+    std::unordered_map<const BufferNode *, std::unordered_set<int>>
+        buffer_writer_wgs;
+    std::unordered_map<const VarNode *, std::unordered_set<int>> var_reader_wgs;
+    std::unordered_map<const VarNode *, std::unordered_set<int>> var_writer_wgs;
+
+    auto add_accesses = [&](const TaskNode *task, int reader_key, int wg_id) {
+      for (const auto &region : task->GetReadRegions()) {
+        if (IsRegisterRegion(region)) {
+          buffer_reader_wgs[region->buffer.get()].insert(reader_key);
+        }
+      }
+      if (wg_id >= 0) {
+        for (const auto &region : task->GetWriteRegions()) {
+          if (IsRegisterRegion(region)) {
+            buffer_writer_wgs[region->buffer.get()].insert(wg_id);
+          }
+        }
+      }
+      for (const auto &v : task->GetReadVars()) {
+        var_reader_wgs[v.get()].insert(reader_key);
+      }
+      if (wg_id >= 0) {
+        for (const auto &v : task->GetWriteVars()) {
+          var_writer_wgs[v.get()].insert(wg_id);
+        }
+      }
+    };
+
+    for (auto &task_ctx : all_tasks) {
+      TaskNode *task = task_ctx.task;
+      int wg_id = task->GetWarpgroupId();
+      int reader_key = (wg_id >= 0) ? wg_id : kReaderAnyWg;
+      add_accesses(task, reader_key, wg_id);
+    }
+    // Also include structural tasks
+    std::function<void(IRStructure *)> walk_structural =
+        [&](IRStructure *node) {
+          if (!node)
+            return;
+          auto add_struct = [&](const TaskNode *t) {
+            if (!t)
+              return;
+            int wg = t->GetWarpgroupId();
+            int key = (wg >= 0) ? wg : kReaderAnyWg;
+            if (IsWarpgroupBroadcast(wg))
+              key = kReaderAnyWg;
+            add_accesses(t, key, -1);
+          };
+          if (node->IsControl()) {
+            auto *c = static_cast<ControlNode *>(node);
+            add_struct(c->task.get());
+            walk_structural(c->child.get());
+          } else if (node->IsWrapper()) {
+            auto *w = static_cast<WrapperNode *>(node);
+            add_struct(w->task.get());
+            walk_structural(w->child.get());
+          } else if (node->IsIf()) {
+            auto *i = static_cast<IfNode *>(node);
+            add_struct(i->task.get());
+            walk_structural(i->then_child.get());
+            walk_structural(i->else_child.get());
+          } else if (node->IsSequence()) {
+            auto *s = static_cast<SequenceNode *>(node);
+            for (auto &c : s->children)
+              walk_structural(c.get());
+          } else if (node->IsScheduleUnit()) {
+            auto *u = static_cast<ScheduleUnit *>(node);
+            walk_structural(u->child.get());
+          }
+          // Leaf tasks already handled by the all_tasks loop.
+        };
+    walk_structural(root);
+
+    std::unordered_set<const BufferNode *> cross_wg_buffers;
+    for (const auto &kv : buffer_reader_wgs) {
+      const auto *buf = kv.first;
+      const auto &reader_wgs = kv.second;
+      const auto &writer_wgs = buffer_writer_wgs[buf];
+      for (int rwg : reader_wgs) {
+        if (writer_wgs.find(rwg) == writer_wgs.end()) {
+          cross_wg_buffers.insert(buf);
+          break;
+        }
+      }
+    }
+
+    std::unordered_set<const VarNode *> cross_wg_vars;
+    for (const auto &kv : var_reader_wgs) {
+      const auto *v = kv.first;
+      const auto &reader_wgs = kv.second;
+      auto it_w = var_writer_wgs.find(v);
+      if (it_w == var_writer_wgs.end())
+        continue;
+      const auto &writer_wgs = it_w->second;
+      for (int rwg : reader_wgs) {
+        if (writer_wgs.find(rwg) == writer_wgs.end()) {
+          cross_wg_vars.insert(v);
+          break;
+        }
+      }
+    }
+
+    if (!cross_wg_buffers.empty() || !cross_wg_vars.empty()) {
+      for (auto &task_ctx : all_tasks) {
+        TaskNode *task = task_ctx.task;
+        if (IsWarpgroupBroadcast(task->GetWarpgroupId()))
+          continue;
+        bool should_broadcast = false;
+        for (const auto &region : task->GetWriteRegions()) {
+          if (IsRegisterRegion(region) &&
+              cross_wg_buffers.count(region->buffer.get())) {
+            should_broadcast = true;
+            break;
+          }
+        }
+        if (!should_broadcast) {
+          for (const auto &v : task->GetWriteVars()) {
+            if (cross_wg_vars.count(v.get())) {
+              should_broadcast = true;
+              break;
+            }
+          }
+        }
+        if (should_broadcast) {
+          task->SetWarpgroupId(kWarpgroupBroadcast);
+          changed = true;
+        }
+      }
+    }
+  }
+}
+
 bool HasResourceDependency(const IRStructure *a, const IRStructure *b) {
   if (a->UsesTMACore() && b->UsesTMACore())
     return true;
@@ -251,6 +497,12 @@ void CollectPrefixTasks(IRStructure *root,
         break;
       }
     }
+    for (auto *pre : prefix_tasks) {
+      if (HasDependency(task, pre)) {
+        has_dep = true;
+        break;
+      }
+    }
     if (has_dep) {
       rejected.push_back(task);
     } else {
@@ -277,6 +529,10 @@ void CollectSuffixTasks(IRStructure *root,
   std::unordered_set<TaskNode *> candidate_set;
   for (int i = static_cast<int>(items.size()) - 1; i >= 0; --i) {
     auto *item = items[i];
+    if (item->GetSchedulePhase() == SchedulePhase::kPrologue) {
+      rejected.push_back(item);
+      continue;
+    }
     if (item->IsControl()) {
       rejected.push_back(item);
       continue;
@@ -353,7 +609,9 @@ void CollectSuffixTasks(IRStructure *root,
   }
 }
 
-bool AssignWarpgroupIdsGlobal(IRStructure *root, bool enable_warp_partition) {
+std::vector<PrimExpr>
+AssignWarpgroupIdsGlobal(IRStructure *root, const WarpSpecializeConfig &config,
+                         PrimExpr thread_count) {
   if (!root) {
     LOG(FATAL) << "Empty root";
   }
@@ -365,10 +623,40 @@ bool AssignWarpgroupIdsGlobal(IRStructure *root, bool enable_warp_partition) {
     LOG(FATAL) << "No task";
   }
 
+  bool enable_partition = config.enable_warpgroup_partition;
+  if (auto thread_count_num = as_const_int(thread_count)) {
+    if (config.enable_warp_partition) {
+      enable_partition &= (*thread_count_num >= 64);
+    } else {
+      enable_partition &= (*thread_count_num % 32 == 0);
+    }
+  } else {
+    enable_partition = false;
+  }
+
+  if (!enable_partition) {
+    for (auto &task_ctx : all_tasks) {
+      TaskNode *task = task_ctx.task;
+      if (task->ContainsLoopBreak()) {
+        task->SetWarpgroupId(kWarpgroupBroadcast);
+      } else {
+        task->SetWarpgroupId(0);
+      }
+    }
+    return {thread_count};
+  }
+
   int n = all_tasks.size();
 
   for (auto &task_ctx : all_tasks) {
-    task_ctx.task->SetWarpgroupId(-1);
+    task_ctx.task->SetWarpgroupId(kWarpgroupUnassigned);
+  }
+
+  // Tasks with loop_break are broadcast to all warp groups
+  for (auto &task_ctx : all_tasks) {
+    if (task_ctx.task->ContainsLoopBreak()) {
+      task_ctx.task->SetWarpgroupId(kWarpgroupBroadcast);
+    }
   }
 
   TaskUnionFind uf(n);
@@ -380,11 +668,20 @@ bool AssignWarpgroupIdsGlobal(IRStructure *root, bool enable_warp_partition) {
     }
   }
 
-  std::unordered_set<TaskNode *> prefix_tasks;
-  CollectPrefixTasks(root, prefix_tasks);
+  std::unordered_set<TaskNode *> prefix_tasks, suffix_tasks;
+  if (config.producer_thread_count == 32) {
+    CollectPrefixTasks(root, prefix_tasks);
+    for (auto *task : prefix_tasks) {
+      task->SetSchedulePhase(SchedulePhase::kPrologue);
+      task->SetWarpgroupId(0);
+    }
 
-  std::unordered_set<TaskNode *> suffix_tasks;
-  CollectSuffixTasks(root, all_tasks, uf, suffix_tasks);
+    CollectSuffixTasks(root, all_tasks, uf, suffix_tasks);
+    for (auto *task : suffix_tasks) {
+      task->SetSchedulePhase(SchedulePhase::kEpilogue);
+      task->SetWarpgroupId(0);
+    }
+  }
 
   std::unordered_map<int, std::vector<int>> components;
   for (int i = 0; i < n; i++) {
@@ -436,6 +733,28 @@ bool AssignWarpgroupIdsGlobal(IRStructure *root, bool enable_warp_partition) {
               return a.weighted_latency > b.weighted_latency;
             });
 
+  if (config.enable_warp_partition) {
+    for (const auto &comp : component_infos) {
+      int assigned_warpgroup = 0;
+      if (comp.uses_tensor_core_ && !comp.uses_tma_core_) {
+        assigned_warpgroup = 0;
+      } else if (!comp.uses_tensor_core_ && comp.uses_tma_core_) {
+        assigned_warpgroup = 1;
+      } else {
+        assigned_warpgroup = 3;
+      }
+      for (int idx : comp.task_indices) {
+        TaskNode *task = all_tasks[idx].task;
+        if (!task->ContainsLoopBreak()) {
+          task->SetWarpgroupId(assigned_warpgroup);
+        }
+      }
+    }
+    return {IntImm(DataType::Int(32), 32), IntImm(DataType::Int(32), 32),
+            IntImm(DataType::Int(32), 64),
+            thread_count - IntImm(DataType::Int(32), 128)};
+  }
+
   int64_t warpgroup0_latency = 0;
   int64_t warpgroup1_latency = 0;
 
@@ -452,7 +771,11 @@ bool AssignWarpgroupIdsGlobal(IRStructure *root, bool enable_warp_partition) {
 
   int64_t max_latency = std::max(warpgroup0_latency, warpgroup1_latency);
   int64_t min_latency = std::min(warpgroup0_latency, warpgroup1_latency);
-  if ((double)max_latency < 1.1 * min_latency) {
+  bool double_thread = (double)max_latency < 1.1 * min_latency;
+  if (auto thread_count_num = as_const_int(thread_count)) {
+    double_thread &= *thread_count_num <= 128;
+  }
+  if (double_thread) {
     int64_t warpgroup0_latency = 0;
     int64_t warpgroup1_latency = 0;
 
@@ -473,7 +796,7 @@ bool AssignWarpgroupIdsGlobal(IRStructure *root, bool enable_warp_partition) {
         }
       }
     }
-    return true;
+    return {thread_count, thread_count};
   } else {
     int64_t warpgroup0_latency = 0;
     int64_t warpgroup1_latency = 0;
@@ -500,10 +823,18 @@ bool AssignWarpgroupIdsGlobal(IRStructure *root, bool enable_warp_partition) {
         }
       }
     }
-    return false;
+    return {thread_count,
+            IntImm(DataType::Int(32), config.producer_thread_count)};
   }
 }
 
+/*
+  Recursively schedule root node, after scheduling IRStructure satisfies the
+following properties: 1) For each SequenceNode, its children are reordered by Z3
+scheduler and wrapped in ScheduleUnits. 2) For each ControlNode, its child is a
+SequenceNode with Z3-scheduled children wrapped in ScheduleUnits. 3) For each
+IfNode, its then_child and else_child are recursively scheduled (if exist).
+*/
 void ScheduleUnitBuilder::ScheduleRecursive(
     std::shared_ptr<IRStructure> &node, const std::set<Buffer> &used_buffers) {
   if (!node)
@@ -582,6 +913,12 @@ void ScheduleUnitBuilder::ScheduleRecursive(
     }
 
     seq->children = ChildrenScheduleHelper(origin_children);
+    int64_t overall_latency = 0;
+    for (const auto &child : seq->children) {
+      overall_latency += child->GetLatency();
+    }
+    seq->SetLatency(overall_latency);
+    seq->SetII(overall_latency);
     return;
   } else if (node->IsControl()) {
     auto ctrl = static_cast<ControlNode *>(node.get());
@@ -627,6 +964,11 @@ void ScheduleUnitBuilder::ScheduleRecursive(
         Z3SchedulePythonLoop(ctrl, used_buffers);
       } else {
         ScheduleRecursive(ctrl->child, used_buffers);
+        auto old_child = ctrl->child;
+        auto seq_node = std::make_shared<SequenceNode>();
+        seq_node->children = {old_child};
+        ctrl->child = seq_node;
+        Z3SchedulePythonLoop(ctrl, used_buffers);
       }
     }
     return;
@@ -650,7 +992,28 @@ void ScheduleUnitBuilder::ScheduleRecursive(
     }
     auto seq_node = std::make_shared<SequenceNode>();
     seq_node->children = ChildrenScheduleHelper(origin_children);
+    int64_t overall_latency = 0;
+    for (const auto &child : seq_node->children) {
+      overall_latency += child->GetLatency();
+    }
+    seq_node->SetLatency(overall_latency);
+    seq_node->SetII(overall_latency);
     node = seq_node;
+    return;
+  } else if (node->IsIf()) {
+    auto if_node = static_cast<IfNode *>(node.get());
+    if (if_node->then_child) {
+      ScheduleRecursive(if_node->then_child, used_buffers);
+    }
+    if (if_node->else_child) {
+      ScheduleRecursive(if_node->else_child, used_buffers);
+    }
+    if_node->SetLatency(
+        std::max(if_node->then_child ? if_node->then_child->GetLatency() : 0,
+                 if_node->else_child ? if_node->else_child->GetLatency() : 0));
+    if_node->SetII(
+        std::max(if_node->then_child ? if_node->then_child->GetII() : 0,
+                 if_node->else_child ? if_node->else_child->GetII() : 0));
     return;
   }
 
@@ -659,7 +1022,9 @@ void ScheduleUnitBuilder::ScheduleRecursive(
 
 // --- Naive scheduling implementation ---
 
-bool NaiveAssignWarpgroupIds(IRStructure *root) {
+std::vector<PrimExpr>
+NaiveAssignWarpgroupIds(IRStructure *root, const WarpSpecializeConfig &config,
+                        PrimExpr thread_count) {
   if (!root)
     LOG(FATAL) << "Empty root";
 
@@ -668,44 +1033,78 @@ bool NaiveAssignWarpgroupIds(IRStructure *root) {
   if (all_tasks.empty())
     LOG(FATAL) << "No task";
 
+  bool enable_partition = config.enable_warpgroup_partition;
+  if (auto thread_count_num = as_const_int(thread_count)) {
+    if (config.enable_warp_partition) {
+      enable_partition &= (*thread_count_num >= 64);
+    } else {
+      enable_partition &= (*thread_count_num % 32 == 0);
+    }
+  } else {
+    enable_partition = false;
+  }
+
+  if (!enable_partition) {
+    for (auto &task_ctx : all_tasks) {
+      TaskNode *task = task_ctx.task;
+      if (task->ContainsLoopBreak()) {
+        task->SetWarpgroupId(kWarpgroupBroadcast);
+      } else {
+        task->SetWarpgroupId(0);
+      }
+    }
+    return {thread_count};
+  }
+
   // Simple producer/consumer assignment:
   // TMA tasks → wg1 (producer), compute tasks → wg0 (consumer)
   for (auto &task_ctx : all_tasks) {
     TaskNode *task = task_ctx.task;
     if (task->ContainsLoopBreak()) {
-      task->SetWarpgroupId(-1);
+      task->SetWarpgroupId(kWarpgroupBroadcast);
       continue;
     }
-    if (task->UsesTMACore() && !task->UsesTensorCore()) {
+    if (task->HasTMALoad()) {
       task->SetWarpgroupId(1); // producer
     } else {
       task->SetWarpgroupId(0); // consumer
     }
   }
 
-  // Collect prefix/suffix tasks and reset them to neutral
-  std::unordered_set<TaskNode *> prefix_tasks;
-  CollectPrefixTasks(root, prefix_tasks);
-  for (auto *task : prefix_tasks) {
-    task->SetWarpgroupId(-1);
-  }
+  if (config.enable_warp_partition) {
+    // Collect prefix/suffix tasks and reset them to neutral
+    std::unordered_set<TaskNode *> prefix_tasks;
+    CollectPrefixTasks(root, prefix_tasks);
+    for (auto *task : prefix_tasks) {
+      task->SetSchedulePhase(SchedulePhase::kPrologue);
+      task->SetWarpgroupId(0);
+    }
 
-  int n = all_tasks.size();
-  TaskUnionFind uf(n);
-  for (int i = 0; i < n; i++) {
-    for (int j = i + 1; j < n; j++) {
-      if (UseSameRegisterRegion(all_tasks[i].task, all_tasks[j].task)) {
-        uf.unite(i, j);
+    int n = all_tasks.size();
+    TaskUnionFind uf(n);
+    for (int i = 0; i < n; i++) {
+      for (int j = i + 1; j < n; j++) {
+        if (UseSameRegisterRegion(all_tasks[i].task, all_tasks[j].task)) {
+          uf.unite(i, j);
+        }
       }
     }
-  }
-  std::unordered_set<TaskNode *> suffix_tasks;
-  CollectSuffixTasks(root, all_tasks, uf, suffix_tasks);
-  for (auto *task : suffix_tasks) {
-    task->SetWarpgroupId(-1);
+    std::unordered_set<TaskNode *> suffix_tasks;
+    CollectSuffixTasks(root, all_tasks, uf, suffix_tasks);
+    for (auto *task : suffix_tasks) {
+      task->SetSchedulePhase(SchedulePhase::kEpilogue);
+      task->SetWarpgroupId(0);
+    }
   }
 
-  return false; // no double_thread in naive mode
+  // no double_thread in naive mode
+  if (config.enable_thread_extend) {
+    return {thread_count,
+            IntImm(DataType::Int(32), config.producer_thread_count)};
+  } else {
+    return {IntImm(DataType::Int(32), 32), IntImm(DataType::Int(32), 32),
+            thread_count - IntImm(DataType::Int(32), 64)};
+  }
 }
 
 void ScheduleUnitBuilder::NaiveScheduleLoop(ControlNode *ctrl) {
@@ -735,20 +1134,17 @@ void ScheduleUnitBuilder::NaiveScheduleLoop(ControlNode *ctrl) {
 
   // Assign pipeline stages and start times:
   // - TMA load → stage 0, start_time = 0
-  // - Everything else → stage (num_stages - 1), start_time = num_stages
+  // - Everything else → stage (num_stages), start_time = num_stages
   // - All task latencies set to 0, IIperIter = 1
   std::map<IRStructure *, int> stage_map;
   bool has_promoted = false;
   for (auto &child : seq_body->children) {
     IRStructure *node = child.get();
     bool is_tma_load =
-        node->UsesTMACore() && !node->UsesTensorCore() && !node->UsesCUDACore();
-    if (is_tma_load && node->IsTask()) {
-      is_tma_load = static_cast<TaskNode *>(node)->HasTMALoad();
-    }
+        node->IsTask() && static_cast<TaskNode *>(node)->HasTMALoad();
     int stage = !is_tma_load ? 0 : (num_stages);
     stage_map[node] = stage;
-    if (stage != num_stages) {
+    if (stage != 0) {
       has_promoted = true;
     }
     node->SetStartTime(is_tma_load ? 0 : num_stages);
@@ -757,6 +1153,88 @@ void ScheduleUnitBuilder::NaiveScheduleLoop(ControlNode *ctrl) {
   }
 
   ctrl->SetIIperIter(1);
+
+  int n = static_cast<int>(seq_body->children.size());
+  auto IsVarDecl = [](IRStructure *node) -> bool {
+    if (!node || !node->IsTask())
+      return false;
+    auto task = static_cast<TaskNode *>(node);
+    return task->stmts.size() == 1 &&
+           task->stmts[0].as<LetStmtNode>() != nullptr;
+  };
+  auto SolveConflictVar = [&]() -> bool {
+    auto HasVarRawDep = [](const IRStructure *producer,
+                           const IRStructure *consumer) -> bool {
+      for (const auto &w : producer->GetWriteVars()) {
+        for (const auto &r : consumer->GetReadVars()) {
+          if (SameVar(w, r))
+            return true;
+        }
+      }
+      return false;
+    };
+    for (int i = 0; i < n; ++i) {
+      if (!IsVarDecl(seq_body->children[i].get()))
+        continue;
+      for (int j = 0; j < n; ++j) {
+        if (i == j)
+          continue;
+        auto node_i = seq_body->children[i].get();
+        auto node_j = seq_body->children[j].get();
+        if (!HasVarRawDep(node_i, node_j))
+          continue;
+        if (stage_map[node_j] == stage_map[node_i])
+          continue;
+
+        int rem_stage_j = stage_map[node_j];
+        auto node_i_task = static_cast<TaskNode *>(node_i);
+        auto node_i_let_stmt = node_i_task->stmts[0].as<LetStmtNode>();
+
+        auto cloned_let_stmt =
+            LetStmt(node_i_let_stmt->var.copy_with_suffix(""),
+                    node_i_let_stmt->value, Evaluate(0));
+        auto cloned_task = std::make_shared<TaskNode>();
+        cloned_task->stmts.push_back(cloned_let_stmt);
+        cloned_task->SetReadRegions(node_i_task->GetReadRegions());
+        cloned_task->SetWriteRegions(node_i_task->GetWriteRegions());
+        cloned_task->SetReadVars(node_i_task->GetReadVars());
+        {
+          auto write_vars = node_i_task->GetWriteVars();
+          for (auto &v : write_vars) {
+            if (v.same_as(node_i_let_stmt->var)) {
+              v = cloned_let_stmt->var;
+            }
+          }
+          cloned_task->SetWriteVars(write_vars);
+        }
+        cloned_task->SetLatency(node_i_task->GetLatency());
+        cloned_task->SetII(node_i_task->GetII());
+        cloned_task->SetUsesCUDACore(node_i_task->UsesCUDACore());
+        cloned_task->SetUsesTMACore(node_i_task->UsesTMACore());
+        cloned_task->SetUsesTensorCore(node_i_task->UsesTensorCore());
+        stage_map[cloned_task.get()] = rem_stage_j;
+
+        for (int k = j; k < n; ++k) {
+          auto node_k = seq_body->children[k].get();
+          if (rem_stage_j != stage_map[node_k])
+            continue;
+          if (HasVarRawDep(node_i, node_k)) {
+            node_k->SubstituteVar(node_i_let_stmt->var, cloned_let_stmt->var);
+            stage_map[node_k] = rem_stage_j;
+          }
+        }
+
+        seq_body->children.insert(seq_body->children.begin() + j,
+                                  std::move(cloned_task));
+        n += 1;
+        return true;
+      }
+    }
+    return false;
+  };
+  int conflict_count = 0;
+  while (SolveConflictVar() && ++conflict_count < 100)
+    ;
 
   // Estimate overall latency
   int64_t tripcount = 100;
@@ -821,9 +1299,24 @@ void ScheduleUnitBuilder::NaiveScheduleRecursive(
     auto ctrl = static_cast<ControlNode *>(node.get());
     if (ctrl->child) {
       if (ctrl->child->IsSequence() || ctrl->child->IsWrapper()) {
+        std::vector<std::shared_ptr<IRStructure>> origin_children;
+        if (ctrl->child->IsSequence()) {
+          auto seq_body = static_cast<SequenceNode *>(ctrl->child.get());
+          GatherTaskNodes(seq_body->children, origin_children);
+        } else {
+          auto wrapper = static_cast<WrapperNode *>(ctrl->child.get());
+          GatherTaskNodes({wrapper->task, wrapper->child}, origin_children);
+        }
+        for (auto &child : origin_children) {
+          NaiveScheduleRecursive(child);
+        }
         NaiveScheduleLoop(ctrl);
       } else {
         NaiveScheduleRecursive(ctrl->child);
+        auto seq_node = std::make_shared<SequenceNode>();
+        seq_node->children = {ctrl->child};
+        WrapInScheduleUnits(seq_node->children);
+        ctrl->child = seq_node;
       }
     }
   } else if (node->IsWrapper()) {
@@ -837,14 +1330,27 @@ void ScheduleUnitBuilder::NaiveScheduleRecursive(
     WrapInScheduleUnits(origin_children);
     seq_node->children = origin_children;
     node = seq_node;
+  } else if (node->IsIf()) {
+    // IfNode: recursively schedule both branches internally
+    auto if_node = static_cast<IfNode *>(node.get());
+    if (if_node->then_child) {
+      NaiveScheduleRecursive(if_node->then_child);
+    }
+    if (if_node->else_child) {
+      NaiveScheduleRecursive(if_node->else_child);
+    }
   } else {
     LOG(FATAL) << "[NaiveScheduleRecursive] Unknown IRStructure type";
   }
 }
 
-bool ScheduleUnitBuilder::NaiveBuild(std::shared_ptr<IRStructure> &root) {
+std::vector<PrimExpr>
+ScheduleUnitBuilder::NaiveBuild(std::shared_ptr<IRStructure> &root) {
   NaiveScheduleRecursive(root);
-  return NaiveAssignWarpgroupIds(root.get());
+  auto result =
+      NaiveAssignWarpgroupIds(root.get(), config_, thread_var_->dom->extent);
+  PropagateBroadcastWarpgroupId(root.get());
+  return result;
 }
 
 } // namespace tl

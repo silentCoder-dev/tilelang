@@ -39,12 +39,11 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
-#include <unordered_set>
-
 #include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <queue>
 #include <sstream>
@@ -54,8 +53,10 @@
 #include <utility>
 #include <vector>
 
+#include "../layout/layout.h"
 #include "../op/builtin.h"
-#include "../op/gemm_py.h"
+#include "../op/copy.h"
+#include "../op/gemm.h"
 #include "../target/utils.h"
 #include "./common/attr.h"
 #include "./common/collector.h"
@@ -123,6 +124,103 @@ public:
   }
 };
 
+// Detect multiple kernel launches in the PrimFunc body.
+// In tilelang, when multiple T.Kernel() blocks are used, the IR structure is:
+//   root block body:
+//     AttrStmt(tl.assume, ...)
+//       AttrStmt(tl.assume, ...)
+//         SeqStmt [
+//           AttrStmt(blockIdx.x, thread_extent, ..., kernel1_subtree),
+//           AttrStmt(blockIdx.x, thread_extent, ..., kernel2_subtree),
+//         ]
+// Each kernel subtree contains its own launch_threads and tilelang_root block.
+// This class finds that SeqStmt and returns each child as a separate kernel.
+class MultiKernelDetector {
+public:
+  static bool Detect(const Stmt &func_body, std::vector<Stmt> &kernel_stmts,
+                     Stmt &prefix_wrapper) {
+    std::vector<Stmt> stmts;
+    const Stmt *inner = &func_body;
+
+    // Peel through root block -> BlockRealize
+    if (const auto *br = inner->as<BlockRealizeNode>()) {
+      inner = &br->block->body;
+    }
+
+    // Peel through AttrStmt(tl.assume, ...) chains
+    while (const auto *attr = inner->as<AttrStmtNode>()) {
+      if (attr->attr_key != "tl.assume")
+        break;
+      inner = &attr->body;
+    }
+
+    // Check if we have a SeqStmt with multiple children that each contain
+    // a launch_thread (thread_extent)
+    const auto *seq = inner->as<SeqStmtNode>();
+    if (!seq || seq->seq.size() < 2)
+      return false;
+
+    int kernel_count = 0;
+    for (const auto &child : seq->seq) {
+      if (ContainsLaunchThread(child)) {
+        kernel_count++;
+      }
+    }
+
+    if (kernel_count < 2)
+      return false;
+
+    for (const auto &child : seq->seq) {
+      kernel_stmts.push_back(child);
+    }
+    return true;
+  }
+
+private:
+  static bool ContainsLaunchThread(const Stmt &stmt) {
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      if (attr->attr_key == tir::attr::thread_extent) {
+        return true;
+      }
+    }
+    return false;
+  }
+};
+
+// Mutator that replaces the inner SeqStmt (inside root block -> tl.assume
+// chain) with a new body. Used to reassemble multi-kernel results.
+class InnerSeqStmtReplacer : public StmtMutator {
+public:
+  explicit InnerSeqStmtReplacer(Stmt new_inner) : new_inner_(new_inner) {}
+
+  Stmt VisitStmt_(const BlockRealizeNode *op) override {
+    auto new_block_body = this->VisitStmt(op->block->body);
+    if (new_block_body.same_as(op->block->body))
+      return GetRef<Stmt>(op);
+    auto new_block =
+        Block(op->block->iter_vars, op->block->reads, op->block->writes,
+              op->block->name_hint, new_block_body, op->block->init,
+              op->block->alloc_buffers, op->block->match_buffers,
+              op->block->annotations);
+    return BlockRealize(op->iter_values, op->predicate, new_block);
+  }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) override {
+    if (op->attr_key == "tl.assume") {
+      auto new_body = this->VisitStmt(op->body);
+      if (new_body.same_as(op->body))
+        return GetRef<Stmt>(op);
+      return AttrStmt(op->node, op->attr_key, op->value, new_body);
+    }
+    return GetRef<Stmt>(op);
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode *op) override { return new_inner_; }
+
+private:
+  Stmt new_inner_;
+};
+
 // Mutator to replace the body of tilelang_root block
 class TilelangRootBodyReplacer : public StmtMutator {
 public:
@@ -183,6 +281,7 @@ protected:
       auto control_node = std::make_shared<ControlNode>();
       control_node->control = GetRef<For>(op);
       control_node->task = std::make_shared<TaskNode>();
+      control_node->task->SetWarpgroupId(kWarpgroupBroadcast);
       control_node->task->stmts.push_back(
           For(op->loop_var, op->min, op->extent, op->kind, Evaluate(0),
               op->thread_binding, op->annotations, op->step, op->span));
@@ -229,21 +328,49 @@ protected:
     root_ = std::move(task_node);
   }
 
-  void VisitStmt_(const IfThenElseNode *op) override {
-    // If statement -> treat as TaskNode for now (could be refined later)
+  void VisitStmt_(const BufferStoreNode *op) override {
     auto task_node = std::make_shared<TaskNode>();
     task_node->stmts.push_back(GetRef<Stmt>(op));
 
-    AnalyzeMemoryExpr(op->condition, task_node.get());
-    AnalyzeResourceUsage(Evaluate(op->condition), task_node.get(), true);
-
-    // Analyze both branches for resource usage
-    AnalyzeResourceUsage(op->then_case, task_node.get());
-    if (op->else_case) {
-      AnalyzeResourceUsage(op->else_case.value(), task_node.get());
-    }
+    AnalyzeResourceUsage(GetRef<Stmt>(op), task_node.get());
 
     root_ = std::move(task_node);
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) override {
+    // If statement -> IfNode with independently schedulable branches
+    auto if_node = std::make_shared<IfNode>();
+    if_node->condition = op->condition;
+
+    // Create task for condition expression resource analysis
+    auto cond_task = std::make_shared<TaskNode>();
+    cond_task->stmts.push_back(Evaluate(op->condition));
+    AnalyzeMemoryExpr(op->condition, cond_task.get());
+    AnalyzeResourceUsage(Evaluate(op->condition), cond_task.get(), true);
+    if_node->task = std::move(cond_task);
+
+    // Recursively build then branch
+    VisitStmt(op->then_case);
+    if (root_) {
+      if_node->then_child = std::move(root_);
+    }
+
+    // Recursively build else branch (if present)
+    if (op->else_case) {
+      VisitStmt(op->else_case.value());
+      if (root_) {
+        if_node->else_child = std::move(root_);
+      }
+    }
+
+    // Latency = max of both branches
+    int64_t then_latency =
+        if_node->then_child ? if_node->then_child->GetLatency() : 0;
+    int64_t else_latency =
+        if_node->else_child ? if_node->else_child->GetLatency() : 0;
+    if_node->SetLatency(std::max(then_latency, else_latency));
+
+    root_ = std::move(if_node);
   }
 
   void VisitStmt_(const LetStmtNode *op) override {
@@ -251,6 +378,7 @@ protected:
     auto wrapper_node = std::make_shared<WrapperNode>();
     wrapper_node->wrapper = GetRef<Stmt>(op);
     auto task_node = std::make_shared<TaskNode>();
+    task_node->SetWarpgroupId(kWarpgroupBroadcast);
     task_node->stmts.push_back(GetLetDecl(op));
     AnalyzeResourceUsage(GetLetDecl(op), task_node.get());
     wrapper_node->task = std::move(task_node);
@@ -269,6 +397,7 @@ protected:
     auto wrapper_node = std::make_shared<WrapperNode>();
     wrapper_node->wrapper = GetRef<Stmt>(op);
     auto task_node = std::make_shared<TaskNode>();
+    task_node->SetWarpgroupId(kWarpgroupBroadcast);
     task_node->stmts.push_back(GetAttrDecl(op));
     AnalyzeResourceUsage(GetAttrDecl(op), task_node.get());
     wrapper_node->task = std::move(task_node);
@@ -347,10 +476,9 @@ private:
       void VisitExpr_(const CallNode *op) override {
         // Check for specific TileLang operations
         static const auto copy_op = Op::Get("tl.tileop.copy");
-        static const auto gemm_py_op = Op::Get("tl.tileop.gemm_py");
         static const auto gemm_op = Op::Get("tl.tileop.gemm");
-        static const auto wgmma_gemm_py_op = Op::Get("tl.tileop.wgmma_gemm_py");
         static const auto wgmma_gemm_op = Op::Get("tl.tileop.wgmma_gemm");
+        static const auto tcgen05_gemm_op = Op::Get("tl.tileop.tcgen05_gemm");
         static const auto reduce_op = Op::Get("tl.tileop.reduce");
         static const auto fill_op = Op::Get("tl.tileop.fill");
         static const auto region_op = Op::Get("tl.tileop.region");
@@ -362,38 +490,42 @@ private:
         }
 
         // Check if this is a TMA copy operation
-        if (op->op.same_as(copy_op)) {
-          bool found_global = false, found_shared = false;
-          int idx_global = -1, idx_shared = -1;
-          for (unsigned idx = 0; idx != 2; ++idx) {
-            auto region = Downcast<Call>(op->args[idx]);
-            if (const auto *buffer_load =
-                    region->args[0].as<BufferLoadNode>()) {
-              Buffer buffer = buffer_load->buffer;
-              String scope = buffer.scope();
-              MemoryType mem_type = GetMemoryTypeFromScope(scope);
-              if (mem_type == MemoryType::kGlobal) {
-                found_global = true;
-                idx_global = idx;
-              }
-              if (mem_type == MemoryType::kShared) {
-                found_shared = true;
-                idx_shared = idx;
-              }
-            }
-          }
-          found_tma = false;
-          if (found_global && found_shared) {
-            if (idx_global == 0 && idx_shared == 1) {
+        static const auto tma_copy_op = Op::Get("tl.tileop.tma_copy");
+        static const auto async_copy_op = Op::Get("tl.tileop.async_copy");
+
+        bool is_copy_like = op->op.same_as(copy_op) ||
+                            op->op.same_as(tma_copy_op) ||
+                            op->op.same_as(async_copy_op);
+
+        if (is_copy_like) {
+          Copy copy_obj(op->args, op->annotations);
+          const CopyNode *copy = copy_obj.get();
+
+          if (copy->GetIsAsyncCopy()) {
+            // T.async_copy() — cp.async path, never TMA.
+          } else if (copy->GetIsTmaCopy()) {
+            // Explicit T.tma_copy(): only valid global->shared TMA loads
+            // are producers; TMA stores stay on the consumer side.
+            arith::Analyzer ana;
+            if (copy->CheckBulkLoad(target, &ana, /*check_last_dim=*/false)) {
               found_tma = true;
               found_tma_load = true;
             }
-            if (idx_global == 1 && idx_shared == 0)
-              found_tma = true;
+          } else {
+            // Generic T.copy(): check if TMA is possible.
+            arith::Analyzer ana;
+            if (!copy->GetDisableTMA()) {
+              if (copy->CheckBulkLoad(target, &ana, /*check_last_dim=*/true)) {
+                found_tma = true;
+                found_tma_load = true;
+              }
+              if (copy->CheckBulkStore(target, &ana, /*check_last_dim=*/true)) {
+                found_tma = true;
+              }
+            }
           }
-        } else if (op->op.same_as(gemm_py_op) || op->op.same_as(gemm_op) ||
-                   op->op.same_as(wgmma_gemm_py_op) ||
-                   op->op.same_as(wgmma_gemm_op)) {
+        } else if (op->op.same_as(gemm_op) || op->op.same_as(wgmma_gemm_op) ||
+                   op->op.same_as(tcgen05_gemm_op)) {
           found_tensor = true;
 
           int64_t m = op->args[5].as<IntImmNode>()->value;
@@ -403,9 +535,9 @@ private:
 
           // Determine the final GemmInst using GemmPyNode::getGemmInst
           if (target.defined()) {
-            GemmPy gemm_py(op->args);
+            Gemm gemm(op->args);
             GemmInst inst =
-                gemm_py->getGemmInst(static_cast<int>(block_size), target);
+                gemm->getGemmInst(static_cast<int>(block_size), target);
             ICHECK(!has_gemm_inst || gemm_inst == inst)
                 << "All gemm operations in a task must use the same GemmInst, "
                 << "but got " << GemmInstToString(gemm_inst) << " and "
@@ -552,6 +684,124 @@ private:
 
 Stmt ReNestLetStmts(const Stmt &stmt);
 
+// Result of scheduling a single kernel segment
+struct ScheduledKernelResult {
+  Stmt scheduled_body;
+  std::vector<Buffer> barrier_buffers;
+  Map<ObjectRef, ObjectRef> barrier_map;
+  std::vector<MultiVersionBufferInfo> buffer_infos;
+  std::vector<Buffer> duplicated_fragment_buffers;
+  PrimExpr updated_thread_extent;
+};
+
+// Schedule a single kernel body (the logic previously inlined in AutoSchedule).
+// This handles IRStructure building, ScheduleUnit building, barrier analysis,
+// and warpgroup partition for one kernel.
+static ScheduledKernelResult
+ScheduleSingleKernel(const Stmt &kernel_body, IterVar thread_var, Target target,
+                     const WarpSpecializeConfig &config, bool aggressive,
+                     bool enable_epi) {
+  ScheduledKernelResult result;
+
+  // Calculate thread count for latency estimation
+  int64_t latency_thread_count = 1;
+  if (thread_var.defined() && thread_var->dom.defined()) {
+    PrimExpr thread_extent = thread_var->dom->extent;
+    if (const int64_t *extent_ptr = as_const_int(thread_extent)) {
+      latency_thread_count = *extent_ptr;
+      if (latency_thread_count < 1)
+        latency_thread_count = 1;
+    }
+  }
+
+  // Build IRStructure from the body to schedule
+  IRStructureBuilder builder;
+  auto ir_structure = builder.Build(kernel_body, latency_thread_count, target);
+
+  // Print the built IRStructure with all statements
+  ICHECK(ir_structure) << "IRStructure is null (empty body?)";
+
+  // Build ScheduleUnits from IRStructure
+  ScheduleUnitBuilder unit_builder;
+  if (thread_var.defined()) {
+    unit_builder.SetThreadVar(thread_var);
+  } else {
+    LOG(FATAL) << "Could not find thread index variable, warpgroup "
+                  "partition will use default";
+  }
+  unit_builder.SetWarpSpecializeConfig(config);
+  unit_builder.SetSharedMemoryLimit(GetSharedMemoryLimit(target));
+
+  std::vector<PrimExpr> thread_count;
+  if (!aggressive) {
+    thread_count = unit_builder.NaiveBuild(ir_structure);
+  } else {
+    thread_count = unit_builder.Build(ir_structure);
+  }
+
+  // Print the modified summary view
+  // PrintIRStructure(ir_structure.get());
+
+  // Analyze buffer dependencies and insert barriers before warpgroup
+  // partition
+  int next_barrier_id = 1;
+  LoopNestingInfo loop_info;
+  PrimExpr updated_thread_extent = std::accumulate(
+      thread_count.begin() + 1, thread_count.end(), thread_count[0]);
+  result.updated_thread_extent = updated_thread_extent;
+  Buffer neutral_sync_shared_barrier =
+      makeBarrierBuffer(updated_thread_extent, "neutral_sync_shared_barrier", 1,
+                        result.barrier_buffers, result.barrier_map);
+  AnalyzeAndInsertBarriers(ir_structure.get(), next_barrier_id,
+                           result.barrier_buffers, result.barrier_map,
+                           thread_count, loop_info, result.buffer_infos,
+                           neutral_sync_shared_barrier, /*is_root=*/true);
+
+  // Apply warpgroup partition to entire IRStructure
+  result.scheduled_body = ApplyWarpgroupPartitionToIRStructure(
+      ir_structure.get(), thread_var, result.barrier_buffers,
+      result.barrier_map, enable_epi, thread_count, config,
+      neutral_sync_shared_barrier, result.duplicated_fragment_buffers);
+  return result;
+}
+
+// Helper: add barrier buffers and barrier_map to the tilelang_root block
+static Stmt AddBarrierBuffersToRoot(const Stmt &body,
+                                    const std::vector<Buffer> &barrier_buffers,
+                                    Map<ObjectRef, ObjectRef> &barrier_map) {
+  class TilelangRootAllocBufferAdder : public StmtMutator {
+  public:
+    explicit TilelangRootAllocBufferAdder(
+        const std::vector<Buffer> &buffers_to_add,
+        Map<ObjectRef, ObjectRef> &barrier_map)
+        : buffers_to_add_(buffers_to_add), barrier_map_(barrier_map) {}
+
+    Stmt VisitStmt_(const BlockNode *op) override {
+      auto block = GetRef<Block>(op);
+      if (op->name_hint == "tilelang_root") {
+        // Combine existing alloc_buffers with new buffers
+        Array<Buffer> new_alloc_buffers = op->alloc_buffers;
+        for (const auto &buffer : buffers_to_add_) {
+          new_alloc_buffers.push_back(buffer);
+        }
+        auto new_annotations = op->annotations;
+        new_annotations.Set("barrier_init", barrier_map_);
+        // Create new block with updated alloc_buffers
+        return Block(op->iter_vars, op->reads, op->writes, op->name_hint,
+                     op->body, op->init, new_alloc_buffers, op->match_buffers,
+                     new_annotations);
+      }
+      return StmtMutator::VisitStmt_(op);
+    }
+
+  private:
+    std::vector<Buffer> buffers_to_add_;
+    Map<ObjectRef, ObjectRef> &barrier_map_;
+  };
+  TilelangRootAllocBufferAdder adder(barrier_buffers, barrier_map);
+  return adder(body);
+}
+
 // The main pass function
 tvm::transform::Pass AutoSchedule(const bool enable_epi) {
   using namespace tir::transform;
@@ -566,85 +816,71 @@ tvm::transform::Pass AutoSchedule(const bool enable_epi) {
     }
     auto config = GetWarpSpecializeConfig(target);
 
-    // Extract the body of tilelang_root block if it exists
-    TilelangRootBodyExtractor extractor;
-    extractor(func->body);
-    Stmt body_to_schedule;
-    bool has_tilelang_root = false;
-    PrimExpr updated_thread_extent; // Will be set if warpgroup partition
-                                    // doubles thread extent
-    IterVar thread_var; // Thread index variable for warpgroup partition
-
-    if (extractor.body.defined()) {
-      body_to_schedule = extractor.body;
-      has_tilelang_root = true;
-    } else {
-      LOG(FATAL);
-      body_to_schedule = func->body;
-    }
-
-    // Get thread index variable for warpgroup partition
-    // First try to get from body_to_schedule, if not found, try from the entire
-    // function body
-    thread_var = ThreadTagChecker::GetThreadVar(body_to_schedule);
-    if (!thread_var.defined()) {
-      thread_var = ThreadTagChecker::GetThreadVar(func->body);
-    }
-
-    // Calculate thread count for latency estimation
-    int64_t latency_thread_count = 1;
-    if (thread_var.defined() && thread_var->dom.defined()) {
-      PrimExpr thread_extent = thread_var->dom->extent;
-      if (const int64_t *extent_ptr = as_const_int(thread_extent)) {
-        latency_thread_count = *extent_ptr;
-        if (latency_thread_count < 1)
-          latency_thread_count = 1;
-      }
-    }
-
-    // Build IRStructure from the body to schedule
-    IRStructureBuilder builder;
-    auto ir_structure =
-        builder.Build(body_to_schedule, latency_thread_count, target);
-
-    // Print the built IRStructure with all statements
-    ICHECK(ir_structure) << "IRStructure is null (empty body?)";
-
     // Check if aggressive auto-schedule is enabled
     bool aggressive =
         ctx->GetConfig<Bool>(kEnableAggressiveAutoSchedule, Bool(true)).value();
 
-    // Build ScheduleUnits from IRStructure
-    ScheduleUnitBuilder unit_builder;
-    thread_var = ThreadTagChecker::GetThreadVar(body_to_schedule);
-    if (!thread_var.defined()) {
-      thread_var = ThreadTagChecker::GetThreadVar(func->body);
-    }
-    if (thread_var.defined()) {
-      unit_builder.SetThreadVar(thread_var);
-    } else {
-      LOG(FATAL) << "Could not find thread index variable, warpgroup "
-                    "partition will use default";
-    }
-    unit_builder.SetEnableWarpPartition(config.enable_warp_partition);
-    unit_builder.SetSharedMemoryLimit(config.shared_memory_limit);
+    // Detect multiple kernel launches in the PrimFunc body.
+    // When multiple T.Kernel() blocks are used, the IR has a SeqStmt
+    // containing separate kernel subtrees, each with its own tilelang_root.
+    std::vector<Stmt> kernel_stmts;
+    Stmt prefix_wrapper;
+    bool is_multi_kernel =
+        MultiKernelDetector::Detect(func->body, kernel_stmts, prefix_wrapper);
 
-    bool double_thread;
-    if (!aggressive) {
-      double_thread = unit_builder.NaiveBuild(ir_structure);
-    } else {
-      double_thread = unit_builder.Build(ir_structure);
-    }
+    if (!is_multi_kernel) {
+      // --- Single-kernel path (original behavior) ---
+      // Extract the body of tilelang_root block if it exists
+      TilelangRootBodyExtractor extractor;
+      extractor(func->body);
+      Stmt body_to_schedule;
 
-    if (!config.enable_warpgroup_partition) {
-      Stmt new_body = ConvertIRStructureToStmt(ir_structure.get(), enable_epi);
+      if (extractor.body.defined()) {
+        body_to_schedule = extractor.body;
+      } else {
+        LOG(FATAL);
+        body_to_schedule = func->body;
+      }
+
+      // Get thread index variable for warpgroup partition
+      // First try to get from body_to_schedule, if not found, try from the
+      // entire function body
+      IterVar thread_var = ThreadTagChecker::GetThreadVar(body_to_schedule);
+      if (!thread_var.defined()) {
+        thread_var = ThreadTagChecker::GetThreadVar(func->body);
+      }
+
+      auto kr = ScheduleSingleKernel(body_to_schedule, thread_var, target,
+                                     config, aggressive, enable_epi);
 
       // If we extracted from tilelang_root block, replace the body
       Stmt final_body;
-      TilelangRootBodyReplacer replacer(new_body);
+      TilelangRootBodyReplacer replacer(kr.scheduled_body);
       final_body = replacer(func->body);
 
+      // Apply thread extent update if warpgroup partition was applied
+      // (sm_90 only)
+      if (config.enable_thread_extend) {
+        ThreadExtentUpdater extent_updater(kr.updated_thread_extent);
+        final_body = extent_updater(final_body);
+      }
+      // Add barrier buffers to tilelang_root block's alloc_buffers
+      if (!kr.barrier_buffers.empty() ||
+          !kr.duplicated_fragment_buffers.empty()) {
+        std::vector<Buffer> all_alloc_buffers = kr.barrier_buffers;
+        all_alloc_buffers.insert(all_alloc_buffers.end(),
+                                 kr.duplicated_fragment_buffers.begin(),
+                                 kr.duplicated_fragment_buffers.end());
+        final_body = AddBarrierBuffersToRoot(final_body, all_alloc_buffers,
+                                             kr.barrier_map);
+      }
+      // Apply multi-version alloc_buffer rewrite if needed
+      if (!kr.buffer_infos.empty()) {
+        final_body = RewriteAllocBuffers(final_body, kr.buffer_infos);
+      }
+
       final_body = ReNestLetStmts(final_body);
+      final_body = StripUnusedLetStmts(final_body);
 
       // Create a new PrimFunc with the updated body
       auto new_func = PrimFunc(func->params, final_body, func->ret_type,
@@ -652,112 +888,103 @@ tvm::transform::Pass AutoSchedule(const bool enable_epi) {
       return new_func;
     }
 
-    // Print the modified summary view
-    // PrintIRStructure(ir_structure.get());
+    // --- Multi-kernel path ---
+    // Each kernel_stmts[i] is a complete kernel subtree:
+    //   AttrStmt(blockIdx.x) -> ... -> AttrStmt(threadIdx.x) ->
+    //     BlockRealize("tilelang_root") -> body
+    // Schedule each independently and reassemble with shared memory
+    // boundary markers between them.
+    Array<Stmt> combined_stmts;
 
-    // Analyze buffer dependencies and insert barriers before warpgroup
-    // partition
-    int next_barrier_id = 1;
-    std::vector<Buffer> barrier_buffers;
-    Map<ObjectRef, ObjectRef> barrier_map;
-    // Determine thread count for barrier arrive_count calculations
-    PrimExpr thread_count[2];
-    if (!config.enable_thread_extend) {
-      ICHECK(config.enable_warp_partition);
-      // sm_100: use fixed warp size (32) for both partitions
-      thread_count[0] = IntImm(DataType::Int(32), 32);
-      thread_count[1] = IntImm(DataType::Int(32), 32);
-    } else {
-      // sm_90: original behavior
-      thread_count[0] = thread_var->dom->extent;
-      thread_count[1] = double_thread ? thread_var->dom->extent
-                                      : IntImm(DataType::Int(32),
-                                               config.producer_thread_count);
-    }
-    LoopNestingInfo loop_info;
-    std::vector<MultiVersionBufferInfo> buffer_infos;
-    PrimExpr barrier_count = config.enable_thread_extend
-                                 ? thread_count[0] + thread_count[1]
-                                 : thread_var->dom->extent;
-    Buffer neutral_sync_shared_barrier =
-        makeBarrierBuffer(barrier_count, "neutral_sync_shared_barrier", 1,
-                          barrier_buffers, barrier_map);
-    AnalyzeAndInsertBarriers(
-        ir_structure.get(), next_barrier_id, barrier_buffers, barrier_map,
-        thread_count, loop_info, buffer_infos, neutral_sync_shared_barrier);
+    for (size_t i = 0; i < kernel_stmts.size(); ++i) {
+      Stmt kernel_subtree = kernel_stmts[i];
 
-    // Print the modified summary view
-    // PrintIRStructure(ir_structure.get());
+      // Extract the tilelang_root body from this kernel subtree
+      TilelangRootBodyExtractor extractor;
+      extractor(kernel_subtree);
 
-    // Apply warpgroup partition to entire IRStructure
-    Stmt new_body = ApplyWarpgroupPartitionToIRStructure(
-        ir_structure.get(), thread_var, barrier_buffers, barrier_map,
-        enable_epi, thread_count, double_thread, config,
-        neutral_sync_shared_barrier);
-
-    if (config.enable_thread_extend) {
-      // sm_90: may need to update thread extent
-      if (double_thread) {
-        updated_thread_extent = thread_var->dom->extent * 2;
-      } else {
-        updated_thread_extent =
-            thread_var->dom->extent +
-            IntImm(DataType::Int(32), config.producer_thread_count);
-      }
-    }
-
-    // If we extracted from tilelang_root block, replace the body
-    Stmt final_body;
-    TilelangRootBodyReplacer replacer(new_body);
-    final_body = replacer(func->body);
-    // Apply thread extent update if warpgroup partition was applied (sm_90
-    // only)
-    if (config.enable_thread_extend) {
-      ThreadExtentUpdater extent_updater(updated_thread_extent);
-      final_body = extent_updater(final_body);
-    }
-    // Add barrier buffers to tilelang_root block's alloc_buffers
-    if (!barrier_buffers.empty()) {
-      class TilelangRootAllocBufferAdder : public StmtMutator {
-      public:
-        explicit TilelangRootAllocBufferAdder(
-            const std::vector<Buffer> &buffers_to_add,
-            Map<ObjectRef, ObjectRef> &barrier_map)
-            : buffers_to_add_(buffers_to_add), barrier_map_(barrier_map) {}
-
-        Stmt VisitStmt_(const BlockNode *op) override {
-          auto block = GetRef<Block>(op);
-          if (op->name_hint == "tilelang_root") {
-            // Combine existing alloc_buffers with new buffers
-            Array<Buffer> new_alloc_buffers = op->alloc_buffers;
-            for (const auto &buffer : buffers_to_add_) {
-              new_alloc_buffers.push_back(buffer);
-            }
-            auto new_annotations = op->annotations;
-            new_annotations.Set("barrier_init", barrier_map_);
-            // Create new block with updated alloc_buffers
-            return Block(op->iter_vars, op->reads, op->writes, op->name_hint,
-                         op->body, op->init, new_alloc_buffers,
-                         op->match_buffers, new_annotations);
-          }
-          return StmtMutator::VisitStmt_(op);
+      if (!extractor.body.defined()) {
+        // Not a schedulable kernel (no tilelang_root), pass through
+        if (!combined_stmts.empty()) {
+          combined_stmts.push_back(
+              AttrStmt(Integer(0), attr::kAutoScheduleSharedMemoryBoundary, 0,
+                       Evaluate(0)));
         }
+        combined_stmts.push_back(kernel_subtree);
+        continue;
+      }
 
-      private:
-        std::vector<Buffer> buffers_to_add_;
-        Map<ObjectRef, ObjectRef> &barrier_map_;
-      };
+      Stmt body_to_schedule = extractor.body;
 
-      TilelangRootAllocBufferAdder adder(barrier_buffers, barrier_map);
-      final_body = adder(final_body);
+      // Get thread index variable for this kernel
+      IterVar thread_var = ThreadTagChecker::GetThreadVar(kernel_subtree);
+      if (!thread_var.defined()) {
+        // Fallback: pass through without scheduling
+        if (!combined_stmts.empty()) {
+          combined_stmts.push_back(
+              AttrStmt(Integer(0), attr::kAutoScheduleSharedMemoryBoundary, 0,
+                       Evaluate(0)));
+        }
+        combined_stmts.push_back(kernel_subtree);
+        continue;
+      }
+
+      // Schedule this kernel independently
+      auto kr = ScheduleSingleKernel(body_to_schedule, thread_var, target,
+                                     config, aggressive, enable_epi);
+
+      // Replace the tilelang_root body in this kernel subtree
+      Stmt scheduled_subtree;
+      {
+        TilelangRootBodyReplacer replacer(kr.scheduled_body);
+        scheduled_subtree = replacer(kernel_subtree);
+      }
+
+      // Apply thread extent update if warpgroup partition was applied
+      // (sm_90 only)
+      if (config.enable_thread_extend) {
+        ThreadExtentUpdater extent_updater(kr.updated_thread_extent);
+        scheduled_subtree = extent_updater(scheduled_subtree);
+      }
+      // Add barrier buffers to this kernel's tilelang_root block
+      if (!kr.barrier_buffers.empty() ||
+          !kr.duplicated_fragment_buffers.empty()) {
+        std::vector<Buffer> all_alloc_buffers = kr.barrier_buffers;
+        all_alloc_buffers.insert(all_alloc_buffers.end(),
+                                 kr.duplicated_fragment_buffers.begin(),
+                                 kr.duplicated_fragment_buffers.end());
+        scheduled_subtree = AddBarrierBuffersToRoot(
+            scheduled_subtree, all_alloc_buffers, kr.barrier_map);
+      }
+      // Apply multi-version alloc_buffer rewrite if needed
+      if (!kr.buffer_infos.empty()) {
+        scheduled_subtree =
+            RewriteAllocBuffers(scheduled_subtree, kr.buffer_infos);
+      }
+
+      // Insert shared memory boundary between kernel segments
+      if (!combined_stmts.empty()) {
+        combined_stmts.push_back(
+            AttrStmt(Integer(0), attr::kAutoScheduleSharedMemoryBoundary, 0,
+                     Evaluate(0)));
+      }
+      combined_stmts.push_back(scheduled_subtree);
     }
 
-    // Apply multi-version alloc_buffer rewrite if needed
-    if (!buffer_infos.empty()) {
-      final_body = RewriteAllocBuffers(final_body, buffer_infos);
+    // Reassemble: replace the inner SeqStmt in the PrimFunc body with the
+    // new combined statements
+    Stmt new_inner;
+    if (combined_stmts.size() == 1) {
+      new_inner = combined_stmts[0];
+    } else {
+      new_inner = SeqStmt(combined_stmts);
     }
+
+    InnerSeqStmtReplacer seq_replacer(new_inner);
+    Stmt final_body = seq_replacer(func->body);
 
     final_body = ReNestLetStmts(final_body);
+    final_body = StripUnusedLetStmts(final_body);
 
     // Create a new PrimFunc with the updated body
     auto new_func = PrimFunc(func->params, final_body, func->ret_type,
@@ -912,6 +1139,96 @@ Stmt ReNestLetStmts(const Stmt &stmt) {
 }
 
 // StmtMutator to rewrite alloc_buffers in Block nodes
+namespace {
+
+bool LayoutShapesEqual(const Array<PrimExpr> &lhs, const Array<PrimExpr> &rhs,
+                       arith::Analyzer *analyzer) {
+  if (lhs.size() != rhs.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < lhs.size(); ++i) {
+    if (!analyzer->CanProveEqual(lhs[i], rhs[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Expand an annotated Layout so its InputShape matches the multi-versioned
+// buffer shape by prepending the leading "num_versions" dim(s).
+Layout ExpandAnnotatedLayoutForMultiVersionedBuffer(const Layout &layout,
+                                                    const Buffer &old_buffer,
+                                                    const Buffer &new_buffer) {
+  if (!layout.defined() ||
+      new_buffer->shape.size() <= old_buffer->shape.size()) {
+    return Layout();
+  }
+
+  arith::Analyzer analyzer;
+  if (!LayoutShapesEqual(layout->InputShape(), old_buffer->shape, &analyzer)) {
+    return Layout();
+  }
+
+  size_t leading_ndim = new_buffer->shape.size() - old_buffer->shape.size();
+  Array<PrimExpr> trailing_shape;
+  Array<PrimExpr> leading_shape;
+  for (size_t i = 0; i < leading_ndim; ++i) {
+    leading_shape.push_back(new_buffer->shape[i]);
+  }
+  for (size_t i = 0; i < old_buffer->shape.size(); ++i) {
+    trailing_shape.push_back(new_buffer->shape[leading_ndim + i]);
+  }
+  if (!LayoutShapesEqual(trailing_shape, old_buffer->shape, &analyzer)) {
+    return Layout();
+  }
+
+  return layout->Expand(leading_shape);
+}
+
+// Walk the block's layout_map annotation and expand any entries whose buffer
+// has been multi-versioned so downstream LayoutInference sees a matching shape.
+bool UpdateExpandedLayoutMapForRemappedAllocs(
+    const std::vector<std::pair<Buffer, Buffer>> &remapped_allocs,
+    Map<String, ffi::Any> *annotations) {
+  if (remapped_allocs.empty() || !annotations->count(attr::kLayoutMap)) {
+    return false;
+  }
+
+  auto layout_map_ref = annotations->Get(attr::kLayoutMap);
+  if (!layout_map_ref.has_value()) {
+    return false;
+  }
+  auto layout_map = layout_map_ref.value().as<Map<Var, Layout>>();
+  if (!layout_map.has_value()) {
+    return false;
+  }
+
+  Map<Var, Layout> updated_layout_map = layout_map.value();
+  std::unordered_set<const VarNode *> visited;
+  bool changed = false;
+  for (const auto &[old_buffer, new_buffer] : remapped_allocs) {
+    if (!visited.insert(old_buffer->data.get()).second ||
+        !updated_layout_map.count(old_buffer->data)) {
+      continue;
+    }
+    Layout layout = updated_layout_map[old_buffer->data];
+    Layout expanded = ExpandAnnotatedLayoutForMultiVersionedBuffer(
+        layout, old_buffer, new_buffer);
+    if (!expanded.defined()) {
+      continue;
+    }
+    updated_layout_map.Set(old_buffer->data, expanded);
+    changed = true;
+  }
+
+  if (changed) {
+    annotations->Set(attr::kLayoutMap, updated_layout_map);
+  }
+  return changed;
+}
+
+} // namespace
+
 class AllocBufferRewriter : public StmtMutator {
 public:
   AllocBufferRewriter(const std::vector<MultiVersionBufferInfo> &buffer_infos)
@@ -929,11 +1246,13 @@ private:
     // Check if we need to update alloc_buffers
     bool needs_update = false;
     Array<Buffer> new_alloc_buffers;
+    std::vector<std::pair<Buffer, Buffer>> remapped_allocs;
 
     for (auto buffer : op->alloc_buffers) {
       auto it = buffer_remap_.find(buffer);
       if (it != buffer_remap_.end()) {
         new_alloc_buffers.push_back(it->second);
+        remapped_allocs.emplace_back(buffer, it->second);
         needs_update = true;
       } else {
         new_alloc_buffers.push_back(buffer);
@@ -944,6 +1263,8 @@ private:
     new_block->body = new_body;
     if (needs_update) {
       new_block->alloc_buffers = new_alloc_buffers;
+      UpdateExpandedLayoutMapForRemappedAllocs(remapped_allocs,
+                                               &new_block->annotations);
     }
     return Stmt(new_block);
   }

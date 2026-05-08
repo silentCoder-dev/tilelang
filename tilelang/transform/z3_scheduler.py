@@ -8,7 +8,11 @@ import tvm_ffi
 import os
 import json
 import time
+import threading
 from pathlib import Path
+
+# Global lock to serialize Z3 calls — Z3 is not thread-safe
+_z3_lock = threading.Lock()
 
 # Try to import z3, but handle missing installation gracefully
 try:
@@ -79,10 +83,8 @@ def z3_schedule_python(
     n = len(latencies)
 
     # For small number of tasks, return trivial schedule
-    if n <= 1:
-        if n == 1:
-            return [0], [0]
-        return [], []
+    if n < 1:
+        raise RuntimeError("Z3 scheduling failed: n too small")
 
     if verbose:
         print(f"[Python Z3] Starting scheduling for {n} tasks")
@@ -206,8 +208,9 @@ def z3_schedule_ffi(latencies, iis, resource_flags, data_deps, resource_deps):
             if hasattr(resource_deps[i], "__len__") and len(resource_deps[i]) == 2:
                 resource_deps_list.append((int(resource_deps[i][0]), int(resource_deps[i][1])))
 
-    # Call the actual scheduler
-    start_times, _ = z3_schedule_python(latencies_list, iis_list, resource_flags_list, data_deps_list, resource_deps_list)
+    # Call the actual scheduler (Z3 is not thread-safe, serialize access)
+    with _z3_lock:
+        start_times, _ = z3_schedule_python(latencies_list, iis_list, resource_flags_list, data_deps_list, resource_deps_list)
 
     # Return only start_times, C++ side will sort by start_time
     return start_times
@@ -258,10 +261,8 @@ def z3_schedule_loop_python(
     n = len(latencies)
 
     # For small number of tasks, return trivial schedule
-    if n <= 1:
-        if n == 1:
-            return [0], [0]
-        return [], []
+    if n < 1:
+        raise RuntimeError("Z3 loop scheduling failed: n too small")
 
     if verbose:
         print(f"[Python Z3 Loop] Starting scheduling for {n} tasks")
@@ -320,7 +321,7 @@ def z3_schedule_loop_python(
         for i in range(len(buffer_sizes)):
             solver.add(buffer_vars[i] >= 1)
             solver.add(buffer_vars[i] <= num_stages)
-        # solver.add(z3.Sum([buffer_vars[i] * buffer_sizes[i] for i in range(len(buffer_sizes))]) <= memory_limit)
+        solver.add(z3.Sum([buffer_vars[i] * buffer_sizes[i] for i in range(len(buffer_sizes))]) <= memory_limit)
 
         # Add data dependency constraints with distance
         for u, v, distance in data_deps:
@@ -666,10 +667,11 @@ def z3_schedule_loop_ffi(num_stages, latencies, iis, resource_flags, data_deps, 
             if hasattr(resource_deps[i], "__len__") and len(resource_deps[i]) == 2:
                 resource_deps_list.append((int(resource_deps[i][0]), int(resource_deps[i][1])))
 
-    # Call the actual scheduler
-    start_times, stages, best_ii = z3_schedule_loop_python(
-        num_stages, latencies_list, iis_list, resource_flags_list, data_deps_list, resource_deps_list, buffer_sizes_list, memory_limit
-    )
+    # Call the actual scheduler (Z3 is not thread-safe, serialize access)
+    with _z3_lock:
+        start_times, stages, best_ii = z3_schedule_loop_python(
+            num_stages, latencies_list, iis_list, resource_flags_list, data_deps_list, resource_deps_list, buffer_sizes_list, memory_limit
+        )
 
     # Return start_times and promotes as separate arrays for easier FFI handling
     # C++ side expects a tuple of (start_times_array, promotes_array)
